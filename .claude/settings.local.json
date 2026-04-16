@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l \"E:/rlresearchassistant/backend/\"*.py)",
+      "Read(//e/kkarthikCRAG/**)",
+      "Bash(wc -l \"E:/kkarthikCRAG/\"*.py)",
+      "Bash(wc -l E:/rlresearchassistant/backend/*.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('orchestrator.py'\\).read\\(\\)\\); print\\('orchestrator.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(wc -l E:/rlresearchassistant/backend/*.py E:/rlresearchassistant/src/**/*.jsx E:/rlresearchassistant/src/*.jsx)",
+      "Bash(npm --version)"
+    ]
+  }
+}
