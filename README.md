@@ -46,7 +46,7 @@ MatResOps is a **closed-loop autonomous experimentation system** for polymer and
           cross-linker at 2% to recover tensile."
 ```
 
-**What makes this different from ChatGPT / NotebookLM / Elicit:**
+**What makes this different from ChatGPT / NotebookLM:**
 
 | Feature                    | MatResOps | NotebookLM | Elicit | ChatGPT |
 |----------------------------|:---------:|:----------:|:------:|:-------:|
