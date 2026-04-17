@@ -1,1024 +1,970 @@
-# MatResOps — AI Materials Research Operator
+# Planet Material Labs — AI Research Assistant
 
-> **Planet Material Labs** · Autonomous Closed-Loop Experimentation Platform  
-> *A local-first, AI-powered system for polymer & composites science research*
+> An autonomous, AI-powered materials science research platform built for **Planet Material Labs**. It ingests technical datasheets and research papers, extracts structured material properties using a local LLM, maintains a semantic knowledge base, drives an autonomous experiment loop, and provides a RAG-powered chat interface — all running 100% offline on local hardware.
 
 ---
 
 ## Table of Contents
 
-1. [Vision](#1-vision)
-2. [Architecture Overview](#2-architecture-overview)
-3. [System Requirements](#3-system-requirements)
-4. [Tech Stack Deep Dive](#4-tech-stack-deep-dive)
-5. [Application UI — Panel by Panel](#5-application-ui--panel-by-panel)
-6. [Data Architecture](#6-data-architecture)
-7. [The Autonomous Loop — State Machine](#7-the-autonomous-loop--state-machine)
-8. [API Reference](#8-api-reference)
-9. [Codebase Map](#9-codebase-map)
-10. [Sprint Plan — Progress Tracker](#10-sprint-plan--progress-tracker)
-11. [Running the System](#11-running-the-system)
-12. [Known Issues & Limitations](#12-known-issues--limitations)
-13. [Roadmap — What's Left](#13-roadmap--whats-left)
+1. [Project Overview](#1-project-overview)
+2. [Technology Stack](#2-technology-stack)
+3. [System Architecture](#3-system-architecture)
+4. [Backend Module Reference](#4-backend-module-reference)
+5. [Frontend Component Reference](#5-frontend-component-reference)
+6. [Qdrant Schema — 8 Collections](#6-qdrant-schema--8-collections)
+7. [Data & Ingestion Pipeline](#7-data--ingestion-pipeline)
+8. [Autonomous Research Loop](#8-autonomous-research-loop)
+9. [Chat System](#9-chat-system)
+10. [API Reference](#10-api-reference)
+11. [Project Phases](#11-project-phases)
+12. [Setup & Running](#12-setup--running)
+13. [Directory Structure](#13-directory-structure)
+14. [Known Limitations & Design Decisions](#14-known-limitations--design-decisions)
 
 ---
 
-## 1. Vision
+## 1. Project Overview
 
-MatResOps is a **closed-loop autonomous experimentation system** for polymer and materials science. A researcher sets a natural-language goal — the system does the rest: retrieves relevant knowledge, generates formulation candidates, scores them using heuristic + LLM engines, selects the best, explains *why*, proposes the next hypothesis, and loops — pausing at each iteration for human approval.
+Planet Material Labs is developing AI tooling to accelerate materials research. This assistant is the first internal platform — it replaces manual, spreadsheet-driven property lookup and hypothesis generation with a fully automated pipeline.
+
+**What it does end-to-end:**
 
 ```
-  "Maximize tensile strength (>45 MPa) while keeping elongation >180%
-   and minimizing cost. Prefer bio-based additives."
-                              │
-                              ▼
-         ┌────────────────────────────────────┐
-         │         MATRESOPS ENGINE           │
-         │                                    │
-         │  retrieve → generate → evaluate    │
-         │     → decide → approve → repeat    │
-         └────────────────────────────────────┘
-                              │
-                              ▼
-         "Iteration 4 winner: Config B (0.847)
-          EPDM 75% + Silica 12% + Plasticizer 8%
-          Next: reduce plasticizer to 6%, add
-          cross-linker at 2% to recover tensile."
+PDF Upload → Text Extraction → LLM Property Extraction → Qdrant Storage
+      ↓
+Semantic Search + Knowledge Graph
+      ↓
+Autonomous Experiment Loop (Goal → Hypothesis → Predict → Score → Approve → Next)
+      ↓
+RAG Chat (Materials Expert / Technical Reviewer / Literature Researcher)
 ```
 
-**What makes this different from ChatGPT / NotebookLM / Elicit:**
-
-| Feature                    | MatResOps | NotebookLM | Elicit | ChatGPT |
-|----------------------------|:---------:|:----------:|:------:|:-------:|
-| Fully local / offline      | ✅        | ❌         | ❌     | ❌      |
-| Active experiment loop     | ✅        | ❌         | ❌     | ❌      |
-| TDS structured extraction  | ✅        | ❌         | ⚠️    | ⚠️     |
-| Heuristic scoring engine   | ✅        | ❌         | ❌     | ❌      |
-| Typed decision reasoning   | ✅        | ❌         | ⚠️    | ❌      |
-| Autonomous iteration       | ✅        | ❌         | ❌     | ❌      |
-| 14,000 TDS batch pipeline  | ✅        | ❌         | ❌     | ❌      |
+**Hardware target:** Windows 11, NVIDIA RTX 3050 (4GB VRAM), 16GB RAM. Everything runs locally — no API keys, no cloud, no data leaves the machine.
 
 ---
 
-## 2. Architecture Overview
+## 2. Technology Stack
 
-### 2.1 High-Level System Diagram
+| Layer | Technology | Version / Notes |
+|---|---|---|
+| Frontend framework | React | 18, via Vite |
+| Frontend bundler | Vite + Tauri CLI | Tauri used for future desktop packaging |
+| Styling | Pure CSS (custom design system) | Electric Indigo glassmorphism palette |
+| Icons | lucide-react | — |
+| Charts | Recharts | Used in ResultsPanel |
+| Backend framework | FastAPI | Python 3.11+ |
+| ASGI server | Uvicorn | — |
+| LLM runtime | Ollama | localhost:11434 |
+| LLM model | `qwen2.5:14b-instruct-q4_K_S` | GGUF Q4_K_S, CUDA-accelerated |
+| Embedding model | `nomic-embed-text` | 768-dimensional vectors |
+| Vector database | Qdrant | localhost:6333, local on-disk storage |
+| Qdrant Python client | `qdrant-client` | — |
+| LangChain (RAG) | `langchain-ollama`, `langchain-qdrant` | Used in chat.py |
+| Knowledge graph | NetworkX | In-memory, rebuilt from Qdrant every 300s |
+| PDF parsing | pdfplumber + PyPDF2 | Fallback chain |
 
-```
-╔══════════════════════════════════════════════════════════════════════════════════╗
-║                          MATRESOPS — PLANET MATERIAL LABS                       ║
-║                                                                                  ║
-║  ┌─────────────────────────────────────────────────────────────────────────┐    ║
-║  │                     TAURI v2 DESKTOP SHELL (Rust)                        │    ║
-║  │                                                                          │    ║
-║  │   ┌──────────┐  ┌──────────────────────────────────────────────────┐    │    ║
-║  │   │ SIDEBAR  │  │          REACT + VITE WORKSPACE (18.3)           │    │    ║
-║  │   │          │  │                                                  │    │    ║
-║  │   │ Research │  │  ┌──────────────┐  ┌───────────────────────┐    │    │    ║
-║  │   │ Papers   │  │  │ GOAL PANEL   │  │ KNOWLEDGE VIEW        │    │    │    ║
-║  │   │ Exprmts  │  │  │              │  │                       │    │    │    ║
-║  │   │ Results  │  │  │ Textarea     │  │ Papers · TDS cards    │    │    │    ║
-║  │   │ Decision │  │  │ Weight sliders│  │ Insight chips        │    │    │    ║
-║  │   │ Chat     │  │  │ Start Loop ▶ │  │ Semantic search       │    │    │    ║
-║  │   │          │  │  └──────────────┘  └───────────────────────┘    │    │    ║
-║  │   │ ● Ollama │  │                                                  │    │    ║
-║  │   │ ● Qdrant │  │  ┌────────────────────┐  ┌──────────────────┐  │    │    ║
-║  │   │ ● DuckDB │  │  │ EXPERIMENT DASHBOARD│  │ DECISION PANEL   │  │    │    ║
-║  │   └──────────┘  │  │                    │  │                  │  │    │    ║
-║  │                  │  │ 🏆 Config A 0.847 ▓│  │ 🧠 Reasoning... │  │    │    ║
-║  │                  │  │    Config B 0.731 ▒│  │ Typewriter anim │  │    │    ║
-║  │                  │  │    Config C 0.612 ░│  │ 🔬 Next Hyp.    │  │    │    ║
-║  │                  │  │                    │  │ [Approve ✓]     │  │    │    ║
-║  │                  │  └────────────────────┘  └──────────────────┘  │    │    ║
-║  │                  │                                                  │    │    ║
-║  │                  │  ┌──────────────────────────────────────────┐   │    │    ║
-║  │                  │  │         RESULTS VISUALIZATION             │   │    │    ║
-║  │                  │  │  Radar Chart · Trend Line · Comparisons  │   │    │    ║
-║  │                  │  └──────────────────────────────────────────┘   │    │    ║
-║  │                  └──────────────────────────────────────────────────┘   │    ║
-║  └─────────────────────────────────────────────────────────────────────────┘    ║
-║                                    │                                             ║
-║                        HTTP/REST (localhost:8000)                                ║
-║                                    │                                             ║
-║  ┌─────────────────────────────────▼────────────────────────────────────────┐   ║
-║  │                    FASTAPI PYTHON BACKEND (v0.109)                        │   ║
-║  │                                                                           │   ║
-║  │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ┌───────────────┐  │   ║
-║  │  │ ORCHESTRATOR│  │ EXPERIMENT   │  │    CHAT     │  │  JOB QUEUE    │  │   ║
-║  │  │             │  │   RUNNER     │  │             │  │               │  │   ║
-║  │  │ State machine│  │ predict_    │  │ RAG + 3     │  │ Priority queue│  │   ║
-║  │  │ idle→running │  │ properties()│  │ role personas│  │ Background    │  │   ║
-║  │  │ →approval   │  │ score()     │  │ Session mem │  │ worker thread │  │   ║
-║  │  │ →loop       │  │ suggest()   │  │ SSE support │  │ SHA-256 dedup │  │   ║
-║  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └───────┬───────┘  │   ║
-║  │         │                │                 │                 │           │   ║
-║  │  ┌──────┴────────────────┴─────────────────┴─────────────────┴───────┐  │   ║
-║  │  │                      DATA LAYER                                    │  │   ║
-║  │  │                                                                    │  │   ║
-║  │  │   ┌─────────────────────┐      ┌──────────────────────────────┐   │  │   ║
-║  │  │   │   QDRANT (Docker)   │      │      DUCKDB (Embedded)       │   │  │   ║
-║  │  │   │                     │      │                              │   │  │   ║
-║  │  │   │ parsed_materials     │      │ documents  │ chunks          │   │  │   ║
-║  │  │   │  768-dim vectors     │      │ material_  │ experiments     │   │  │   ║
-║  │  │   │  22+ embeddings      │      │ properties │ experiment_     │   │  │   ║
-║  │  │   │  Cosine similarity   │      │ extraction │ results         │   │  │   ║
-║  │  │   │                     │      │ _data      │ decisions       │   │  │   ║
-║  │  │   │ job_status          │      └──────────────────────────────┘   │  │   ║
-║  │  │   │  1-dim job tracking │                                          │  │   ║
-║  │  │   └─────────────────────┘                                          │  │   ║
-║  │  └────────────────────────────────────────────────────────────────────┘  │   ║
-║  └──────────────────────────────────────────────────────────────────────────┘   ║
-║                                    │                                             ║
-║                        Ollama HTTP API (localhost:11434)                         ║
-║                                    │                                             ║
-║  ┌─────────────────────────────────▼────────────────────────────────────────┐   ║
-║  │                         OLLAMA LOCAL INFERENCE                            │   ║
-║  │                                                                           │   ║
-║  │   ┌────────────────────────────┐   ┌────────────────────────────────┐   │   ║
-║  │   │  qwen2.5:14b-instruct      │   │  nomic-embed-text:latest       │   │   ║
-║  │   │  (LLM generation)          │   │  (text embeddings, 768-dim)    │   │   ║
-║  │   │  ~8GB RAM + partial GPU    │   │  ~274MB VRAM, full GPU         │   │   ║
-║  │   │  15–45s per response       │   │  <500ms per embed              │   │   ║
-║  │   └────────────────────────────┘   └────────────────────────────────┘   │   ║
-║  └──────────────────────────────────────────────────────────────────────────┘   ║
-║                                                                                  ║
-║  Hardware: Intel Core i5 · NVIDIA RTX 3050 4GB VRAM · 32GB DDR4 RAM            ║
-╚══════════════════════════════════════════════════════════════════════════════════╝
-```
+---
 
-### 2.2 Document Ingestion Pipeline
+## 3. System Architecture
 
 ```
-  PDF / DOCX / DOC
-        │
-        ▼
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                    INGESTION PIPELINE                            │
-  │                                                                  │
-  │  ┌──────────────┐     ┌─────────────────┐                       │
-  │  │ FILE WATCHER │────▶│  JOB QUEUE      │                       │
-  │  │              │     │  (job_queue.py)  │                       │
-  │  │ Upload UI    │     │                  │                       │
-  │  │ Folder scan  │     │  Priority:       │                       │
-  │  │ SHA-256 dedup│     │  HIGH  <100KB    │                       │
-  │  └──────────────┘     │  MEDIUM 100-500K │                       │
-  │                        │  LOW   >500KB    │                       │
-  │                        └────────┬─────────┘                       │
-  │                                 │                                  │
-  │                        ┌────────▼─────────┐                       │
-  │                        │  BACKGROUND      │                       │
-  │                        │  WORKER THREAD   │                       │
-  │                        └────────┬─────────┘                       │
-  │                                 │                                  │
-  │              ┌──────────────────┼───────────────┐                 │
-  │              ▼                  ▼               ▼                 │
-  │  ┌────────────────┐  ┌──────────────────┐  ┌──────────────┐     │
-  │  │  TEXT EXTRACT  │  │  TYPE DETECTION   │  │ LLM EXTRACT  │     │
-  │  │  (pdfplumber / │  │                  │  │              │     │
-  │  │   PyMuPDF)     │  │  TDS indicators: │  │  TDS schema: │     │
-  │  │                │  │  "tensile"       │  │  {property,  │     │
-  │  │  Tables → rows │  │  "ASTM", "shore" │  │   value,     │     │
-  │  │  Text → paras  │  │  "mold temp"     │  │   unit,      │     │
-  │  └────────┬───────┘  │                  │  │   confidence}│     │
-  │           │           │  Paper indics:   │  │              │     │
-  │           │           │  "abstract"      │  │  Paper schema│     │
-  │           │           │  "doi:", "et al."│  │  {cause,     │     │
-  │           │           └──────────────────┘  │   effect,    │     │
-  │           │                                  │   magnitude} │     │
-  │           │                                  └──────┬───────┘     │
-  │           │                                         │              │
-  │           ▼                                         ▼              │
-  │  ┌──────────────────────────────────────────────────────────┐    │
-  │  │              STORAGE (PARALLEL WRITE)                     │    │
-  │  │                                                           │    │
-  │  │  nomic-embed-text                                         │    │
-  │  │  (768-dim vector)                                         │    │
-  │  │        │                         │                        │    │
-  │  │        ▼                         ▼                        │    │
-  │  │  ┌───────────┐            ┌────────────────┐             │    │
-  │  │  │  QDRANT   │            │    DUCKDB      │             │    │
-  │  │  │ Semantic  │            │  Structured    │             │    │
-  │  │  │ vector    │            │  properties    │             │    │
-  │  │  │ search    │            │  relational    │             │    │
-  │  │  └───────────┘            │  analytics     │             │    │
-  │  │                           └────────────────┘             │    │
-  │  └──────────────────────────────────────────────────────────┘    │
-  └─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        REACT FRONTEND  :5173                         │
+│                                                                      │
+│  Sidebar   GoalPanel   KnowledgePanel   ExperimentDashboard          │
+│  PapersView  ExperimentsPanel (Kanban)  ChatPanel  DecisionPanel     │
+│  ResultsPanel  DocumentDetails                                       │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │ HTTP / SSE  (localhost:8000)
+┌────────────────────────────▼─────────────────────────────────────────┐
+│                        FASTAPI BACKEND  :8000                        │
+│                                                                      │
+│  main.py ──────── REST + SSE API surface                             │
+│  │                                                                   │
+│  ├── job_queue.py ─── Priority queue, background worker thread       │
+│  │       └── process_job()                                           │
+│  │             ├── parser.py      (PDF → raw text)                   │
+│  │             ├── extractor.py   (text → JSON schema via LLM)       │
+│  │             └── qdrant_store.py (upsert to all collections)       │
+│  │                                                                   │
+│  ├── orchestrator.py ── Autonomous loop state machine                │
+│  │       └── experiment_runner.py (predict + score)                  │
+│  │                                                                   │
+│  ├── chat.py ──────── RAG chat with roles + session memory           │
+│  │       └── qdrant_mgr.py (semantic search)                         │
+│  │                                                                   │
+│  ├── knowledge_graph.py ── NetworkX graph over Qdrant edges          │
+│  ├── crawler.py ─────── Recursive folder scanner                     │
+│  └── qdrant_store.py ── Single storage abstraction (all 8 cols)      │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────────────┐
+│                    QDRANT  :6333  (local on-disk)                    │
+│                                                                      │
+│  documents · doc_chunks · material_properties · experiments          │
+│  knowledge_edges · scanned_folders · job_status · chat_sessions      │
+└──────────────────────────────────────────────────────────────────────┘
+                             │
+┌────────────────────────────▼─────────────────────────────────────────┐
+│                    OLLAMA  :11434  (CUDA)                             │
+│                                                                      │
+│  qwen2.5:14b-instruct-q4_K_S   (LLM — property extraction, chat)    │
+│  nomic-embed-text               (embeddings — 768-dim)               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Request flow — document upload
+
+```
+Browser → POST /api/documents/upload
+  → job_queue: create_job() → queue_job()
+  → background worker: process_job()
+      → parser.extract_text()          # pdfplumber / PyPDF2
+      → extractor.extract_from_text()  # Ollama LLM → JSON
+      → extractor.extract_properties_list()   # flatten schema
+      → qdrant_store.upsert_document()         # documents collection
+      → qdrant_store.upsert_property() × N     # material_properties
+      → qdrant_store.upsert_chunks()           # doc_chunks (768-dim vectors)
+  → Browser polls GET /api/jobs/{job_id} or SSE /api/jobs/{job_id}/stream
+```
+
+### Request flow — chat message
+
+```
+Browser → POST /api/chat
+  → chat.py: ChatSession.add_message()
+  → qdrant_mgr.search(query, limit=5)   # cosine sim on doc_chunks
+  → KnowledgeGraphManager.expand()      # 2-hop PageRank expansion (optional)
+  → build prompt with context + role
+  → OllamaLLM.stream()                  # token-by-token SSE back to browser
+  → ChatSession._save_to_qdrant()       # persist turn to chat_sessions
 ```
 
 ---
 
-## 3. System Requirements
+## 4. Backend Module Reference
 
-### 3.1 Current Development Machine
+### `config.py`
+Central configuration — all URLs, paths, collection names, and model identifiers in one place. No hardcoded strings anywhere else.
 
-| Component     | Spec                                  | Role                              |
-|---------------|---------------------------------------|-----------------------------------|
-| **CPU**       | Intel Core i5 (gen unknown)           | Python backend, Ollama CPU layers |
-| **GPU**       | NVIDIA RTX 3050 4GB VRAM             | LLM GPU layers, embeddings        |
-| **RAM**       | 32GB DDR4                             | Ollama model overflow, DuckDB     |
-| **OS**        | Windows 11 Home Single Language 10.0.26200 | Host                        |
-| **Storage**   | SSD (recommended for 14K TDS files)  | ~20GB for full corpus + models    |
+```python
+LLM_MODEL   = "qwen2.5:14b-instruct-q4_K_S"
+EMBED_MODEL = "nomic-embed-text"
+QDRANT_URL  = "http://localhost:6333"
+OLLAMA_BASE = "http://localhost:11434"
+```
 
-### 3.2 Software Dependencies
+### `main.py`
+FastAPI application. Registers all HTTP and SSE routes, runs Qdrant collection initialization on startup, and starts the job queue worker. Currently at v0.5.0 API surface.
 
-| Software          | Version         | Purpose                          | Install                          |
-|-------------------|-----------------|----------------------------------|----------------------------------|
-| **Python**        | 3.10.8          | Backend runtime                  | python.org                       |
-| **Node.js**       | 23.9.0          | Frontend build                   | nodejs.org                       |
-| **npm**           | 11.2.0          | Package manager                  | bundled with Node                |
-| **Rust**          | latest stable   | Tauri desktop shell              | rustup.rs                        |
-| **Docker**        | latest          | Qdrant vector database           | docker.com                       |
-| **Ollama**        | latest          | Local LLM inference              | ollama.ai                        |
+**Key responsibilities:**
+- `POST /api/documents/upload` — receives PDF, hands to job queue
+- `GET /api/documents` / `GET /api/documents/{id}` — list and fetch documents with full payload (including `methodology`, `key_findings`, `processing_conditions`, `research_objective`)
+- `DELETE /api/documents/{id}` — single document delete
+- `POST /api/documents/bulk-delete` — batch delete by ID list
+- `POST /api/documents/{id}/reprocess` — re-run LLM extraction on existing file
+- `GET/POST /api/experiments` — CRUD for experiments
+- `POST /api/experiments/{id}/predict` — LLM property prediction
+- `POST /api/experiments/{id}/suggest` — next configuration suggestions
+- `POST /api/experiments/{id}/complete` — mark completed with actual output
+- `POST /api/loop/start`, `/iterate`, `/approve`, `/stop` — orchestrator control
+- `PUT /api/loop/hypothesis` — edit pending hypothesis
+- `POST /api/chat`, `GET /api/chat/sessions` — RAG chat
+- `POST /api/folders/scan` — trigger recursive folder crawl
+- `GET /api/stats` — live counts for sidebar badges
 
-### 3.3 Ollama Models (Currently Installed)
+### `parser.py`
+PDF → plain text. Uses `pdfplumber` as primary, falls back to `PyPDF2`. Handles scanned-only PDFs gracefully (returns empty string, logs warning). No OCR currently.
 
-| Model                           | Size    | VRAM    | Purpose                          | Status      |
-|---------------------------------|---------|---------|----------------------------------|-------------|
-| `qwen2.5:14b-instruct-q4_K_S`  | ~9GB    | ~8GB+   | LLM generation, reasoning        | ✅ Active   |
-| `nomic-embed-text:latest`       | ~274MB  | ~274MB  | Text embeddings (768-dim)        | ✅ Active   |
-| `gemma3:4b`                     | ~3GB    | ~2.5GB  | Alt generation model             | Installed   |
-| `llama3.2:3b`                   | ~2GB    | ~1.8GB  | Alt generation model             | Installed   |
-| `phi3:mini`                     | ~2.3GB  | ~2GB    | Fast inference fallback          | Installed   |
-| `gemma3:1b`                     | ~0.8GB  | ~0.6GB  | Ultra-fast fallback              | Installed   |
+### `extractor.py`
+LLM-based structured extraction. Two modes:
 
-> **VRAM note:** 14b model uses partial GPU offload — Ollama splits layers across your 4GB VRAM + 32GB system RAM. Expect 30–90s per LLM response. Embedding calls stay fast (<500ms, fully on GPU).
+| Mode | Input | LLM Output Schema |
+|---|---|---|
+| TDS | Technical Data Sheet text | `material_name`, `extraction_confidence`, `properties[]`, `processing_conditions[]` |
+| Paper | Research paper text | `extraction_confidence`, `material_properties_mentioned[]`, `key_findings[]`, `methodology`, `research_objective` |
 
-### 3.4 Minimum Requirements (Production)
+`extract_from_text()` — calls Ollama, parses JSON response, handles malformed output.
+`extract_properties_list()` — normalises both schemas into a flat list of `{name, value, unit, confidence, context}` dicts.
 
-| Component | Minimum                 | Recommended              |
-|-----------|-------------------------|--------------------------|
-| RAM       | 16GB                    | 32GB+                    |
-| VRAM      | 4GB (partial offload)   | 8GB+ (full 7B GPU)       |
-| Storage   | 50GB SSD                | 200GB NVMe               |
-| CPU       | 6 cores                 | 8+ cores                 |
-| Python    | 3.9+                    | 3.10+                    |
+### `llm.py`
+Thin wrapper around the Ollama HTTP client. Exposes `get_client()` which returns a connection-pooled instance. Also re-exports `LLM_MODEL` so other modules don't import from `config` directly.
+
+### `qdrant_store.py`
+The single storage abstraction for all 8 Qdrant collections. Key methods:
+
+| Method | Collection | Description |
+|---|---|---|
+| `upsert_document()` | `documents` | Create/update document manifest. Accepts `methodology`, `research_objective`, `key_findings`, `processing_conditions`. |
+| `update_document_properties_count()` | `documents` | Patch property count + research fields after re-extraction. |
+| `upsert_chunks()` | `doc_chunks` | Split text → 2000-char chunks with 200-char overlap, embed with `nomic-embed-text`, store. |
+| `upsert_property()` | `material_properties` | One point per extracted property row. |
+| `get_all_documents()` | `documents` | Full list with payload. |
+| `get_document_by_id()` | `documents` | Single document fetch. |
+| `delete_document_by_id()` | `documents` | Remove document + cascade to chunks. |
+| `get_all_file_hashes()` | `documents` | For deduplication in crawler. |
+| `upsert_experiment()` | `experiments` | Store experiment record. |
+| `get_all_experiments()` | `experiments` | List with payload. |
+| `get_chat_session()` / `save_chat_session()` | `chat_sessions` | Persist conversation turns. |
+
+Embedding dimension: **768**. All text vectors use `nomic-embed-text`. Non-text collections (`scanned_folders`, `job_status`) use a 1-dim dummy vector.
+
+### `qdrant_mgr.py`
+Higher-level search wrapper used by `chat.py` and `experiment_runner.py`. Exposes `search(query, limit)` which embeds the query, runs cosine search on `doc_chunks`, and returns ranked results with metadata.
+
+### `job_queue.py`
+In-process priority queue with a single background worker thread.
+
+**Priority tiers (by file size):**
+- HIGH: < 1 MB
+- MEDIUM: 1–10 MB
+- LOW: > 10 MB
+
+Jobs are persisted to the `job_status` Qdrant collection so they survive backend restarts. Each job transitions through: `PENDING → QUEUED → RUNNING → COMPLETED | FAILED | CANCELLED`.
+
+`process_job()` is the core pipeline function — it calls parser → extractor → qdrant_store, then updates the job status record. It extracts and persists `methodology`, `key_findings`, `processing_conditions`, and `research_objective` to the document manifest.
+
+### `orchestrator.py`
+The autonomous research loop state machine.
+
+**States:** `idle → running → awaiting_approval → (loop | stopped)`
+
+**Loop iteration steps (shown in UI progress bar):**
+1. **Retrieve** — semantic search for relevant materials context from Qdrant
+2. **Generate** — LLM generates a hypothesis for the next experiment configuration
+3. **Evaluate** — `experiment_runner.predict_properties()` scores the hypothesis
+4. **Decide** — pick best candidate, compute composite score
+5. **Approve** — pauses and waits for human approval before next iteration
+
+**Composite score formula:**
+```
+score = (strength × w_strength) + (flexibility × w_flexibility) + (cost_factor × w_cost)
+```
+Weights are set by the user in `GoalPanel` sliders (default: 0.50 / 0.35 / 0.15).
+
+Loop state is fully thread-safe (`threading.Lock`). The full history of all iterations is kept in memory during a session.
+
+### `experiment_runner.py`
+Handles two LLM tasks for individual experiments:
+
+- `predict_properties(material_name, composition, conditions)` — pulls relevant Qdrant context, builds prompt, returns predicted property values with confidence
+- `calculate_composite_score(predicted, goal_weights)` — normalises and weights predicted values into a single 0–1 score
+- `suggest_next_configurations(experiment)` — post-completion: suggests 3 next compositions to try
+
+### `knowledge_graph.py`
+NetworkX-backed directed graph built lazily from Qdrant data (TTL: 300s).
+
+**Node types:** `material`, `property`, `document`, `condition`
+**Edge types:** `HAS_PROPERTY`, `IMPROVES`, `DEGRADES`, `SIMILAR_TO`, `MEASURED_BY`, `CONTAINS`
+
+Graph-enhanced search re-ranks results with:
+```
+final_score = 0.6 × vector_score + 0.3 × PageRank + 0.1 × connectivity
+```
+Falls back to pure vector search if NetworkX is not installed or graph build fails.
+
+### `chat.py`
+RAG chat engine. Three expert roles:
+
+| Role ID | Persona |
+|---|---|
+| `material-expert` | Senior Materials Science Expert — detailed technical analysis, standards, grade comparisons |
+| `technical-reviewer` | Technical Document Reviewer — QA, gaps, compliance, red flags |
+| `literature-researcher` | Literature Researcher — paper synthesis, research gaps, methodology comparison |
+
+`ChatSession` stores turns in memory and persists to `chat_sessions` Qdrant collection. Memory window: last **4 turns** (8 messages). Streaming via SSE — tokens arrive token-by-token in the browser.
+
+### `crawler.py`
+Recursive folder scanner. Deduplicates via SHA-256 hash comparison against `get_all_file_hashes()`. Supported extensions: `.pdf`, `.docx`, `.doc`. Queues each new file as a job.
+
+### `startup.py`
+One-time setup script — initialises all Qdrant collections with correct vector configs. Run manually if Qdrant is fresh.
+
+### `bulk_parser.py`
+CLI utility for batch-parsing a directory of PDFs outside the web UI — useful for initial corpus loading.
+
+### `refresh_system.py`
+Utility for rebuilding Qdrant collections from on-disk parsed JSON cache without re-running the LLM — fast re-index after schema changes.
 
 ---
 
-## 4. Tech Stack Deep Dive
+## 5. Frontend Component Reference
 
-### 4.1 Frontend
+All components are in `src/components/`. The app uses React 18 with no external state management library — prop drilling from `App.jsx` for loop/nav state, local `useState` for everything else.
 
-```
-React 18.3  +  Vite 6.0  (inside Tauri v2 desktop shell)
-│
-├── Recharts 3.8 ── Radar chart, Line chart, Bar chart for results
-├── Lucide React 1.8 ── All iconography (~40 icons used)
-├── CSS Custom Properties ── Alpine Lab design system (no CSS framework)
-│   ├── Background:  #0d1a14  (deep forest)
-│   ├── Surface:     #132218 / #1a2e22
-│   ├── Accent:      #3d9970  (muted jade)
-│   ├── Font-mono:   JetBrains Mono (data values)
-│   └── Glass panel: rgba(20,40,28,0.6) + backdrop-filter:blur(12px)
-│
-└── Components (9 total):
-    ├── App.jsx ─────────── Root; loop state, polling, handler wiring
-    ├── Sidebar.jsx ──────── Nav + live Ollama/Qdrant/DuckDB status dots
-    ├── GoalPanel.jsx ────── Goal input + weight sliders + loop controls
-    ├── KnowledgePanel.jsx ─ Papers/TDS cards + insight chips (mock)
-    ├── ExperimentDashboard── Scored candidate cards (real + mock fallback)
-    ├── DecisionPanel.jsx ── Typewriter reasoning + approval controls
-    ├── ResultsPanel.jsx ─── Radar + line charts from DuckDB
-    ├── PapersView.jsx ───── Upload, bulk parse, Qdrant browser, search
-    ├── ExperimentsPanel.jsx─ Experiment history list
-    └── ChatPanel.jsx ────── RAG chat with 3 personas
-```
+### `App.jsx`
+Root component. Owns:
+- `activeNav` — current view (research / papers / experiments / results / decisions / chat)
+- `sidebarCollapsed` — persisted in `localStorage`
+- `loopState` — polled every 3 seconds from `/api/loop/status`
+- `counts` — polled every 5 seconds from `/api/stats`
 
-### 4.2 Backend
+Renders six view layouts: `ResearchView`, `ExperimentsView`, `ResultsOnlyView`, `DecisionsView`, `ChatView`, and `PapersView`. Page transitions use a `view-transition` CSS animation class (0.22s `viewEnter` keyframe) wrapping each view.
 
-```
-FastAPI 0.109  +  Uvicorn (workers=1 ← DuckDB single-writer constraint)
-│
-├── Routing  ── 46 REST endpoints across 8 route groups
-│   ├── /api/stats           ── Live document/experiment counts
-│   ├── /api/documents/*     ── CRUD + extraction data
-│   ├── /api/jobs/*          ── Queue status + SSE streaming progress
-│   ├── /api/bulk-*          ── Folder scanning, bulk parse SSE
-│   ├── /api/search          ── Qdrant semantic search
-│   ├── /api/parsed/*        ── Qdrant document browser
-│   ├── /api/experiments/*   ── Experiment CRUD + predict + suggest
-│   ├── /api/chat/*          ── RAG chat + session management
-│   └── /api/loop/*          ── Autonomous loop orchestration (NEW)
-│
-├── LLM Client (llm.py)
-│   ├── Custom OllamaClient (httpx, 120s timeout)
-│   ├── GPU config: num_gpu=35, num_thread=8, keep_alive=-1
-│   ├── JSON mode: format="json" + extract_json_from_response()
-│   └── json_mode=False: returns raw Ollama response dict
-│
-└── langchain-ollama / langchain-qdrant (for QdrantVectorStore + OllamaEmbeddings)
-    └── NOTE: dual client pattern — OllamaClient (direct) + LangChain (wrapper)
-              Both active. Risk: VRAM eviction if both load model simultaneously.
-```
+### `Sidebar.jsx`
+Collapsible navigation sidebar.
+- Expanded width: `220px` | Collapsed width: `56px`
+- CSS `width` transition (`0.25s cubic-bezier(0.4,0,0.2,1)`) — no JS animation
+- Label text and badge counts hidden at collapsed state via `opacity: 0; width: 0; overflow: hidden`
+- ChevronLeft/Right toggle button pinned to the right edge of the sidebar
+- State persisted in `localStorage` via `App.jsx`
+- System status row (Ollama / Qdrant / Engine) shows icons-only when collapsed, with `title` tooltip
+- Keyboard navigation: ArrowUp/Down moves focus between nav items
 
-### 4.3 Data Layer
+### `GoalPanel.jsx`
+Research goal input and loop control.
+- Text area for research goal description
+- Three weight sliders (Strength / Flexibility / Cost)
+- Loop toggle (start/stop continuous loop) and single-iteration "Run Once" button
+- Shows current loop status, iteration counter, and active step name
 
-```
-┌─────────────────────────────────────────────────────┐
-│                    DUCKDB 0.9.2                      │
-│            (embedded, file: data/research.db)        │
-│                                                      │
-│  Sequences: doc_id, chunk_id, prop_id, exp_id, res_id│
-│                                                      │
-│  documents            chunks                         │
-│  ├── id (auto)        ├── id (auto)                  │
-│  ├── filename         ├── doc_id (FK)                │
-│  ├── file_path        ├── content (TEXT)             │
-│  ├── file_hash        ├── page_number                │
-│  ├── doc_type         └── chunk_type                 │
-│  ├── status                                          │
-│  ├── extraction_status  material_properties          │
-│  ├── extraction_conf    ├── id (auto)                │
-│  ├── llm_output (JSON)  ├── doc_id (FK)              │
-│  └── created_at         ├── property_name            │
-│                         ├── value (TEXT)              │
-│  experiments            ├── unit                     │
-│  ├── id (auto)          ├── confidence               │
-│  ├── name               ├── context                  │
-│  ├── material_id        └── extraction_method        │
-│  ├── material_name                                   │
-│  ├── description      extraction_data                │
-│  ├── conditions (JSON)  ├── id (PK)                  │
-│  ├── expected_output    ├── doc_id (FK)              │
-│  ├── actual_output      ├── data_type                │
-│  ├── status             ├── content                  │
-│  ├── result_analysis    └── confidence               │
-│  ├── confidence_score                                │
-│  ├── recommendation   experiment_results             │
-│  ├── created_at         ├── id (auto)                │
-│  ├── started_at         ├── experiment_id (FK)       │
-│  └── completed_at       ├── metric_name             │
-│                         ├── expected_value           │
-│                         ├── actual_value             │
-│                         ├── deviation_percent        │
-│                         ├── passed (BOOLEAN)         │
-│                         └── test_method             │
-└─────────────────────────────────────────────────────┘
+### `KnowledgePanel.jsx`
+Displays the knowledge graph summary and recently indexed documents. Quick-access view into what the system currently knows.
 
-┌─────────────────────────────────────────────────────┐
-│                QDRANT (Docker container)             │
-│                   localhost:6333                     │
-│                                                      │
-│  Collection: parsed_materials                        │
-│  ├── Vectors: 768-dim (nomic-embed-text)            │
-│  ├── Distance: COSINE                               │
-│  ├── Points: 22 (current)                           │
-│  └── Payload (LangChain nested format):             │
-│      ├── page_content: (document text)              │
-│      └── metadata:                                  │
-│          ├── filename                               │
-│          ├── doc_type   (tds / paper)               │
-│          ├── doc_id     (DuckDB FK)                 │
-│          ├── material_name                          │
-│          ├── extraction_confidence                  │
-│          ├── properties (JSON string)               │
-│          ├── processing_conditions (JSON string)    │
-│          ├── applications (JSON string)             │
-│          ├── key_findings (JSON string)             │
-│          └── processed_at (ISO timestamp)           │
-│                                                     │
-│  Collection: job_status                             │
-│  └── 1-dim dummy vectors for job state persistence │
-└─────────────────────────────────────────────────────┘
-```
+### `ExperimentDashboard.jsx`
+Compact experiment overview embedded in the Research view. Shows recent experiments with status and confidence scores. Clicking a row fires `onSelect` to populate `ResultsPanel`.
+
+### `ExperimentsPanel.jsx`
+Full experiments view — 3-column kanban board.
+
+| Column | Statuses | Header colour |
+|---|---|---|
+| Queued | `pending`, `queued` | Muted grey |
+| Running | `running` | Electric Indigo (`#6d6af8`) |
+| Completed | `completed`, `failed` | Green / Red |
+
+**`KanbanCard`** features:
+- 3px status-coloured left border
+- Experiment name (bold) + iteration badge (mono, top-right corner)
+- Material name (mono, muted, ellipsis overflow)
+- Confidence bar (100%, 3px tall) + percentage — only on completed/failed cards
+- Running cards: `kanban-running-pulse` border animation (indigo cycling)
+- Hover: `translateY(-2px)` + shadow lift
+- Click: opens `ExperimentDetailModal`
+
+**`ExperimentDetailModal`:**
+- Full experiment details, conditions, expected output
+- Test results table (metric / expected / actual / deviation / pass)
+- Inline "Add Result" form
+- AI Predict button (LLM property prediction with Qdrant context)
+- Suggest button (post-completion — next 3 configurations)
+- Complete button (marks experiment done and records actual output)
+- Delete button with confirmation
+
+### `ResultsPanel.jsx`
+Comparative results analysis. Recharts bar and line charts. Shows predicted vs actual property values across iterations. Can be scoped to a selected experiment or show all.
+
+### `DecisionPanel.jsx`
+Shows the current loop state during autonomous operation:
+- Active step progress bar (Retrieve → Generate → Evaluate → Decide → Approve)
+- Current reasoning and hypothesis text (inline-editable)
+- Candidate list with scores
+- Approve / Stop loop buttons
+
+### `PapersView.jsx`
+Document library management.
+
+**Stat bar (top):** Total Documents / TDS Count / Research Papers / Qdrant Points — rendered with `StatCard` (28px, weight 800 numbers in Electric Indigo, amber, green).
+
+**Upload controls:**
+- Single PDF upload via `POST /api/documents/upload`
+- Folder upload (`<input webkitdirectory multiple accept=".pdf">`) — correctly passes all files in a selected directory on Windows Chrome
+- URL/path scan (folder path input → `POST /api/folders/scan`)
+
+**Documents table:**
+- Checkbox column (per-row select + select-all header checkbox)
+- Filename, type badge (TDS / Paper), status, properties extracted count, upload date
+- Bulk delete button appears in panel header when any rows are selected (red styling, shows selected count)
+- Row click → opens `DocumentDetails` modal
+
+**Job queue panel:** Live list of ingestion jobs with status indicator, priority badge, elapsed time, and error messages.
+
+### `DocumentDetails.jsx`
+Full document inspection modal. Six tabs:
+
+| Tab | Content |
+|---|---|
+| Overview | Extraction status, confidence score, doc type, property count |
+| Properties | Table of all extracted property rows (name / value / unit / confidence / context) |
+| Methodology | LLM-extracted research methodology text (papers only) |
+| Key Findings | Bulleted list of extracted findings (papers only) |
+| Limitations | Extracted limitations and caveats (papers only) |
+| Raw Data | Full LLM JSON output for debugging |
+
+**Re-extract button** — re-runs LLM extraction on the stored file. Always refreshes the UI regardless of whether new properties were found (previously had a conditional guard that blocked refresh).
+
+Status field normalised: checks `extraction_status` first, falls back to `status`.
+
+### `ChatPanel.jsx`
+RAG-powered Q&A interface.
+- Role selector (Material Expert / Technical Reviewer / Literature Researcher)
+- Message history with user/assistant chat bubbles
+- SSE streaming — response tokens appear incrementally as they arrive
+- Clear chat button (resets session on backend)
+- `Loader` spinner rendered during generation (previously missing from imports, causing a React render crash that blanked the entire screen on message send)
+
+### `CyberLoader.jsx`
+Loading screen shown on initial app startup while the backend connection is being established. Displays an animated progress bar.
 
 ---
 
-## 5. Application UI — Panel by Panel
+## 6. Qdrant Schema — 8 Collections
 
-### 5.1 Research Workspace (Main View)
+All collections use **flat payloads** — no nested `metadata` key.
 
-```
-╔══════════════════════════════════════════════════════════════════════════╗
-║  MatResOps — AI Research Operator                        Loop: Iter 3 ▲ ║
-╠══════════╦═══════════════════════════════════════════════════════════════╣
-║          ║  ┌─────────────────────────────────────────────────────────┐ ║
-║  🔬      ║  │  ⬡ GOAL CONFIGURATION                      ▲ Awaiting  │ ║
-║ Research ║  │                                                          │ ║
-║          ║  │  Research Goal:                    Optimization Weights: │ ║
-║  📄      ║  │  ┌──────────────────────────┐  Σ = 1.00                 │ ║
-║  Papers  ║  │  │ Maximize tensile strength│  Tensile   ━━━━━━━●  0.50 │ ║
-║          ║  │  │ (>45 MPa) while keeping  │  Flex      ━━━━●    0.35  │ ║
-║  🧪      ║  │  │ elongation >180% and     │  Cost      ━●      0.15   │ ║
-║ Expmts   ║  │  │ minimizing cost...       │                            │ ║
-║          ║  │  └──────────────────────────┘                            │ ║
-║  📊      ║  │  [▶ Loop Active]  [❯ Run 1 Iteration]       Auto-run ⟨●⟩│ ║
-║ Results  ║  └─────────────────────────────────────────────────────────┘ ║
-║          ║                                                               ║
-║  🧠      ║  ┌──────────────────┐  ┌──────────────────────────────────┐ ║
-║ Decision ║  │ 📚 KNOWLEDGE     │  │ 🧪 EXPERIMENT DASHBOARD          │ ║
-║          ║  │                  │  │                         Iter 3·3  │ ║
-║  💬      ║  │ [Papers][Insights]│  │ ┌──────────────────────────────┐ │ ║
-║  Chat    ║  │ 🔍 Search...     │  │ │ 🏆 Config A          Best ✓  │ │ ║
-║          ║  │                  │  │ │ Score: ████████░ 0.847        │ │ ║
-║ ─────    ║  │ [TDS] Makrolon   │  │ │ Tensile:53.2 Elong:210       │ │ ║
-║ System   ║  │ ████ 94% match  │  │ └──────────────────────────────┘ │ ║
-║ ● Ollama ║  │ [Paper] Zhang    │  │ ┌──────────────────────────────┐ │ ║
-║ ● Qdrant ║  │ ████ 89% match  │  │ │ Config B            Rank #2  │ │ ║
-║ ● DuckDB ║  │ ...             │  │ │ Score: ██████░░░ 0.731        │ │ ║
-╚══════════╩══╩══════════════════╩══╩══════════════════════════════════════╝
-```
+### `documents` — Document manifest
 
-### 5.2 Decision Panel (The Key Differentiator)
+| Field | Type | Description |
+|---|---|---|
+| `doc_id` | string | UUID, primary key |
+| `filename` | string | Original filename |
+| `file_path` | string | Absolute path on disk |
+| `file_hash` | string | SHA-256 (for dedup) |
+| `doc_type` | string | `"tds"` or `"paper"` |
+| `extraction_status` | string | `pending / running / completed / failed` |
+| `material_name` | string | Extracted material name |
+| `properties_extracted` | int | Count of property rows |
+| `extraction_confidence` | float | 0.0–1.0 |
+| `methodology` | string | Extracted research methodology (papers) |
+| `research_objective` | string | Extracted research objective (papers) |
+| `key_findings` | JSON string | List of key findings (papers) |
+| `processing_conditions` | JSON string | List of processing conditions |
+| `created_at` | ISO datetime | — |
+| `updated_at` | ISO datetime | — |
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  🧠 Decision Reasoning                           Iteration 3        │
-│                                  ● Awaiting Approval                │
-├─────────────────────────────────────────────────────────────────────┤
-│  [1 Retrieve] ✓ → [2 Generate] ✓ → [3 Evaluate] ✓ → [4 Decide] ● → [5 Approve]  │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  🏆 Selected Configuration                                          │
-│  Config A                                          0.847            │
-│  ┌──────────────┐  ┌──────────────┐                                │
-│  │ Tensile      │  │ Elong.       │                                │
-│  │  53.2 MPa ✓  │  │  210%   ✓   │                                │
-│  └──────────────┘  └──────────────┘                                │
-│                                                                     │
-│  SYSTEM REASONING                                                   │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ Iteration 3: Config A achieved composite score 0.847,       │   │
-│  │ outperforming alternatives across all weighted objectives.  │   │
-│  │ The EPDM 75% + Silica 12% composition showed optimal       │   │
-│  │ balance — tensile of 53.2 MPa exceeds the 45 MPa threshold │   │
-│  │ while elongation of 210% surpasses the 180% floor...█      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                              (typewriter animation ↑)               │
-│                                                                     │
-│  ▶ NEXT HYPOTHESIS                                                  │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │ 🔬  Iteration 4 Proposal                                    │   │
-│  │     Reduce Silica to 10%, introduce cross-linker at 2%      │   │
-│  │     to push tensile above 55 MPa while maintaining elong.   │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│  [✓ Approve & Continue]  [✏ Edit Hypothesis]          [✕ Stop Loop]│
-└─────────────────────────────────────────────────────────────────────┘
-```
+Vector: 768-dim embedding of `filename + material_name`.
 
-### 5.3 Papers & TDS Library
+### `doc_chunks` — Text chunks (primary search target)
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ 📄 Papers & TDS Library           8 documents indexed               │
-├─────────────────────────────────────────────────────────────────────┤
-│  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                    │
-│  │  8     │  │  8     │  │  0     │  │  22    │                    │
-│  │ Total  │  │  TDS   │  │ Papers │  │ Qdrant │                    │
-│  └────────┘  └────────┘  └────────┘  └────────┘                    │
-│                                                                     │
-│  [🔍 Search parsed materials...] [Search] [Qdrant(22)] [Bulk Parse] │
-├─────────────────────────────────────────────────────────────────────┤
-│  Document                     Type     Status      Confidence  Date  │
-│  ─────────────────────────────────────────────────────────────────  │
-│  Makrolon 2607 - TDS f.pdf    ⬡ TDS   ✓ completed    87%   Apr 16  │
-│  CLs1NN_Makrolon-2407.pdf     ⬡ TDS   ✓ completed    82%   Apr 16  │
-│  REAFREE_C2_202892-T...pdf    ⬡ TDS   ✓ completed    79%   Apr 16  │
-│  REAFREE_C2_204401-S...pdf    ⬡ TDS   ✓ completed    81%   Apr 15  │
-│  ─────────────────────────────────────────────────────────────────  │
-│  [+ Upload PDF]  [📁 Folder]             ← Drag & drop supported    │
-└─────────────────────────────────────────────────────────────────────┘
-```
+| Field | Type | Description |
+|---|---|---|
+| `doc_id` | string | Parent document ID |
+| `chunk_index` | int | Position in document |
+| `content` | string | 2000-char text chunk |
+| `filename` | string | Parent filename |
+| `doc_type` | string | Inherited from parent |
 
-### 5.4 Materials Chat
+Vector: 768-dim `nomic-embed-text` embedding of `content`. This is the collection searched during RAG.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  💬 Materials Chat         Role: [Material Expert ▾]                │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────────────────┐   │
-│  │  🤖  Based on the Makrolon 2607 TDS and the REAFREE         │   │
-│  │      documents in your knowledge base:                       │   │
-│  │                                                              │   │
-│  │      Tensile strength at 23°C (ASTM D638): 65 MPa          │   │
-│  │      Elongation at break: 120%                              │   │
-│  │      Flexural modulus: 2350 MPa (ISO 178)                  │   │
-│  │                                                              │   │
-│  │      Sources: [Makrolon 2607 TDS] [REAFREE C2 204401]      │   │
-│  └─────────────────────────────────────────────────────────────┘   │
-│                                                                     │
-│  ┌─────────────────────────────────────────────────┐  [Send ▶]     │
-│  │ Ask about materials, properties, formulations... │               │
-│  └─────────────────────────────────────────────────┘               │
-│  Roles: Material Expert · Technical Reviewer · Literature Researcher│
-└─────────────────────────────────────────────────────────────────────┘
-```
+### `material_properties` — Structured property rows
+
+| Field | Type | Description |
+|---|---|---|
+| `doc_id` | string | Parent document |
+| `property_name` | string | e.g. "Tensile Strength" |
+| `value` | any | Numeric or string |
+| `unit` | string | e.g. "MPa" |
+| `confidence` | float | LLM extraction confidence |
+| `context` | string | Test standard or note |
+
+### `experiments` — Autonomous loop results
+
+| Field | Type | Description |
+|---|---|---|
+| `experiment_id` | string | UUID |
+| `name` | string | Human-readable name |
+| `material_name` | string | Target material |
+| `status` | string | `pending / running / completed / failed` |
+| `conditions` | JSON | `{temperature, pressure, time}` |
+| `expected_output` | JSON | `{tensile_strength, elongation}` |
+| `actual_output` | JSON | Recorded measurements |
+| `results` | JSON | List of `{metric, expected, actual, deviation, passed}` |
+| `confidence` | float | Composite score (0–1) |
+| `iteration` | int | Loop iteration number |
+| `created_at` | ISO datetime | — |
+
+### `knowledge_edges` — Graph edges
+
+| Field | Type | Description |
+|---|---|---|
+| `source` | string | Source node ID |
+| `target` | string | Target node ID |
+| `edge_type` | string | `HAS_PROPERTY / IMPROVES / DEGRADES / SIMILAR_TO / MEASURED_BY / CONTAINS` |
+| `weight` | float | Edge strength |
+
+### `scanned_folders` — Folder registry
+
+Tracks which local paths have been scanned to avoid re-scanning. Uses a 1-dim dummy vector.
+
+### `job_status` — Ingestion job tracking
+
+| Field | Type | Description |
+|---|---|---|
+| `job_id` | string | UUID |
+| `filename` | string | — |
+| `status` | string | `pending / queued / running / completed / failed / cancelled` |
+| `priority` | string | `HIGH / MEDIUM / LOW` |
+| `file_size` | int | Bytes |
+| `error` | string | Error message if failed |
+| `created_at` | ISO datetime | — |
+| `completed_at` | ISO datetime | — |
+
+### `chat_sessions` — Conversation history
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | string | UUID |
+| `messages` | JSON | List of `{role, content, timestamp}` |
+| `created_at` | ISO datetime | — |
 
 ---
 
-## 6. Data Architecture
+## 7. Data & Ingestion Pipeline
 
-### 6.1 Current Data State (as of April 16, 2026)
+### File types supported
+- `.pdf` — primary target (pdfplumber + PyPDF2 fallback)
+- `.docx`, `.doc` — supported by crawler, not yet wired to the direct upload endpoint
 
-| Store     | Count          | Contents                                      |
-|-----------|----------------|-----------------------------------------------|
-| DuckDB    | 8 documents    | 8 TDS (Makrolon PC, REAFREE elastomers)       |
-| DuckDB    | 48 properties  | Tensile, flexural, density, thermal props     |
-| DuckDB    | 0 experiments  | (loop not yet run in production)              |
-| Qdrant    | 22 vectors     | 768-dim embeddings of TDS content             |
-| Qdrant    | 16 job vectors | Job state persistence (1-dim dummy)           |
+### Deduplication
+SHA-256 hash of file content, checked against all hashes in `documents` collection before queuing. Duplicate uploads are rejected silently at the crawler level.
 
-### 6.2 Target Scale
+### Chunking strategy
+- Chunk size: **2000 characters** (~512 tokens at 4 chars/token)
+- Overlap: **200 characters**
+- Each chunk is embedded independently with `nomic-embed-text`
 
-| Metric              | Current   | Target               |
-|---------------------|-----------|----------------------|
-| TDS documents       | 8         | 14,000               |
-| Papers              | 0         | 500+                 |
-| Vector embeddings   | 22        | ~200,000             |
-| Material properties | 48        | ~500,000             |
-| Ingestion time      | instant   | ~12–18 hrs overnight |
+### LLM extraction
+The LLM receives the first ~8000 characters of the document (truncated to stay inside the effective context window for fast inference on 14b models). It is instructed to return strict JSON only — no markdown, no explanation. Malformed JSON triggers a retry with a simplified prompt.
+
+### Priority queue
+Jobs are inserted into a min-heap keyed on `(priority.value, created_at)`. A single daemon thread processes one job at a time. The worker is started on FastAPI startup and runs until the process exits.
 
 ---
 
-## 7. The Autonomous Loop — State Machine
+## 8. Autonomous Research Loop
 
-### 7.1 State Diagram
+The loop is the core differentiator of this platform — it closes the hypothesis–experiment–result cycle with minimal human intervention.
 
-```
-                    ┌─────────────────┐
-                    │                 │
-            ┌──────▶│      IDLE       │◀──────────┐
-            │       │                 │           │
-            │       └────────┬────────┘           │
-            │                │                    │
-            │    POST /api/loop/start              │
-            │    POST /api/loop/iterate            │
-            │                │                    │
-            │                ▼                    │
-            │       ┌─────────────────┐           │
-            │  ┌───▶│                 │           │
-            │  │    │    RUNNING      │           │
-    stop()  │  │    │                 │           │ stop()
-            │  │    └────────┬────────┘           │
-            │  │             │                    │
-            │  │    iteration completes           │
-            │  │    (retrieve→generate→           │
-            │  │     evaluate→decide→persist)     │
-            │  │             │                    │
-            │  │             ▼                    │
-            │  │    ┌─────────────────┐           │
-            │  │    │                 │           │
-            │  └────│   AWAITING      │───────────┘
-            │       │   APPROVAL      │
-            │       │                 │
-            │       └────────┬────────┘
-            │                │
-            │    POST /api/loop/approve
-            │    (runs next iteration)
-            │                │
-            └────────────────┘
-                  (also: stop() from any state → STOPPED)
-```
-
-### 7.2 Iteration Pipeline (what happens inside RUNNING)
+### State machine
 
 ```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                    ONE ITERATION                                 │
-  │                                                                  │
-  │  Step 1: RETRIEVE (active_step = 0)                             │
-  │  ─────────────────────────────────                              │
-  │  • Qdrant semantic search: f"{goal} {current_hypothesis}"       │
-  │  • Top-5 chunks returned (cosine similarity, 768-dim)           │
-  │  • Past experiment results from DuckDB (last 3)                 │
-  │                                                                  │
-  │  Step 2: GENERATE (active_step = 1)                             │
-  │  ─────────────────────────────────                              │
-  │  • LLM prompt: goal + hypothesis + context + past results       │
-  │  • Output: 3 candidate formulations                             │
-  │  • Schema: {label, material_name, composition, processing,      │
-  │             hypothesis}                                          │
-  │  • Fallback: deterministic PC/EPDM/Nylon66 configs if LLM fails │
-  │                                                                  │
-  │  Step 3: EVALUATE (active_step = 2)                             │
-  │  ─────────────────────────────────                              │
-  │  • Per candidate: predict_properties() → LLM predicts           │
-  │    tensile_strength_mpa, elongation_percent, density, etc.      │
-  │  • calculate_composite_score() with user weights:               │
-  │    composite = Σ strength(0.5) + flex(0.35) + cost(0.15)        │
-  │  • Fallback: heuristic random ±variance if LLM fails            │
-  │  • Sort by composite_score descending                           │
-  │                                                                  │
-  │  Step 4: DECIDE (active_step = 3)                               │
-  │  ─────────────────────────────────                              │
-  │  • Best = scored[0]                                             │
-  │  • LLM generates:                                               │
-  │    - reasoning paragraph (3-5 sentences, cites properties)      │
-  │    - next_hypothesis (1-2 sentences for next iteration)         │
-  │  • Fallback: template-generated reasoning                       │
-  │                                                                  │
-  │  Step 5: PERSIST (→ AWAITING_APPROVAL)                          │
-  │  ─────────────────────────────────                              │
-  │  • INSERT INTO experiments (name, material_name, description,   │
-  │    conditions, actual_output, result_analysis, confidence_score, │
-  │    recommendation)                                               │
-  │  • State → AWAITING_APPROVAL, active_step = 4                   │
-  │  • Frontend shows Decision Panel with Approve/Stop/Edit buttons  │
-  └─────────────────────────────────────────────────────────────────┘
+        ┌─────────────────────────────────────────────┐
+        │                    IDLE                      │
+        └──────────────────────┬──────────────────────┘
+                               │ start_loop(goal, weights)
+        ┌──────────────────────▼──────────────────────┐
+        │                   RUNNING                    │
+        │  Step 1: Retrieve (Qdrant RAG context)       │
+        │  Step 2: Generate (LLM hypothesis)           │
+        │  Step 3: Evaluate (predict + score)          │
+        │  Step 4: Decide   (pick best candidate)      │
+        └──────────────────────┬──────────────────────┘
+                               │ iteration complete
+        ┌──────────────────────▼──────────────────────┐
+        │              AWAITING_APPROVAL               │
+        │  Shows reasoning, candidates, scores to user │
+        └──────┬──────────────────────────────┬───────┘
+               │ approve()                    │ stop()
+        ┌──────▼──────┐                ┌──────▼──────┐
+        │   RUNNING   │                │   STOPPED   │
+        │ (next iter) │                └─────────────┘
+        └─────────────┘
 ```
 
-### 7.3 Orchestrator State Object
+### Loop iteration detail
 
-```json
-{
-  "status": "awaiting_approval",
-  "goal": "Maximize tensile strength (>45 MPa)...",
-  "weights": { "strength": 0.50, "flexibility": 0.35, "cost": 0.15 },
-  "iteration": 3,
-  "active_step": 4,
-  "step_names": ["Retrieve", "Generate", "Evaluate", "Decide", "Approve"],
-  "candidates": [
-    {
-      "label": "Config A",
-      "material_name": "EPDM",
-      "composite_score": 0.847,
-      "scores": { "strength": 0.91, "flexibility": 0.78, "cost": 0.70 },
-      "predicted": { "tensile_strength": 53.2, "elongation": 210 },
-      "composition": { "base_polymer": "EPDM 75%", "additives": [...] },
-      "processing": { "temperature_c": 175, "cure_time_min": 20 }
-    }
-  ],
-  "best_candidate": { ...same shape as above... },
-  "reasoning": "Iteration 3: Config A achieved composite score 0.847...",
-  "next_hypothesis": "Iteration 4: Reduce Silica to 10%...",
-  "history": [
-    { "iteration": 1, "best_label": "Config C", "best_score": 0.621, "exp_id": 1 },
-    { "iteration": 2, "best_label": "Config A", "best_score": 0.741, "exp_id": 2 }
-  ]
-}
+1. **Retrieve** — `qdrant_mgr.search(goal)` pulls top-5 most relevant doc chunks as LLM context
+2. **Generate** — LLM is given the goal, current best score, iteration history, and Qdrant context; outputs a hypothesis (material + composition + conditions)
+3. **Evaluate** — `predict_properties()` predicts tensile strength, elongation, modulus from the hypothesis using Qdrant context
+4. **Decide** — `calculate_composite_score()` scores prediction against goal weights; picks best from 3 candidates
+5. **Approve** — loop pauses at `AWAITING_APPROVAL`; user reviews in `DecisionPanel`; can edit the next hypothesis before approving
+
+### Composite score formula
 ```
+score = (strength_value × w_strength) + (flexibility_value × w_flexibility) + (cost_factor × w_cost)
+```
+Default weights: `0.50 / 0.35 / 0.15`. User-configurable in `GoalPanel`.
+
+### Human-in-the-loop controls
+- **Approve** — accept the current decision and proceed to next iteration
+- **Edit hypothesis** — modify the LLM-generated text before it is run
+- **Stop** — halt the loop (state is preserved in memory for the session)
+- **Run Once** — run a single iteration without entering continuous mode
 
 ---
 
-## 8. API Reference
+## 9. Chat System
 
-### 8.1 Loop Orchestration (`/api/loop/*`)
+Every user question is answered in the context of the local document library — no general internet access.
 
-| Method | Endpoint               | Body                              | Description                              |
-|--------|------------------------|-----------------------------------|------------------------------------------|
-| GET    | `/api/loop/status`     | —                                 | Current loop state (poll every 3s)       |
-| POST   | `/api/loop/start`      | `{goal, weights}`                 | Reset + run iteration 1 (blocking, LLM)  |
-| POST   | `/api/loop/iterate`    | —                                 | Run one more iteration (blocking, LLM)   |
-| POST   | `/api/loop/approve`    | —                                 | Approve + run next iteration             |
-| POST   | `/api/loop/stop`       | —                                 | Stop loop (immediate)                    |
-| PUT    | `/api/loop/hypothesis` | `{hypothesis: string}`            | Edit next hypothesis before approve      |
+### Retrieval
+1. Embed user query with `nomic-embed-text`
+2. Cosine search on `doc_chunks` collection (top 5 chunks)
+3. Optionally expand via knowledge graph (2-hop PageRank, when NetworkX is available)
+4. Re-rank: `0.6 × vector_score + 0.3 × PageRank + 0.1 × connectivity`
 
-### 8.2 Documents (`/api/documents/*`)
+### Roles
 
-| Method | Endpoint                         | Description                        |
-|--------|----------------------------------|------------------------------------|
-| GET    | `/api/documents`                 | List all documents                 |
-| POST   | `/api/documents/upload`          | Upload PDF (queues job)            |
-| GET    | `/api/documents/{id}`            | Full document + chunks + properties|
-| GET    | `/api/documents/{id}/properties` | Material properties only           |
-| GET    | `/api/documents/{id}/extraction` | LLM extraction data                |
+| Role | Focus |
+|---|---|
+| Material Expert | Technical property analysis, standards (ISO/ASTM/UL), grade comparisons, alternative materials |
+| Technical Reviewer | QA, compliance gaps, inconsistencies, red flags in property data |
+| Literature Researcher | Paper synthesis, key findings summary, methodology comparison, research gaps |
 
-### 8.3 Jobs (`/api/jobs/*`)
+### Memory
+- Last **4 turns** (8 messages) retained in the LLM context window
+- Full session persisted to `chat_sessions` Qdrant collection between browser refreshes
+- Session ID is stable for the duration of the browser session
 
-| Method | Endpoint                   | Description                             |
-|--------|----------------------------|-----------------------------------------|
-| GET    | `/api/jobs`                | List all jobs (limit=50)                |
-| GET    | `/api/jobs/{id}`           | Single job status                       |
-| GET    | `/api/jobs/{id}/stream`    | SSE stream (real-time progress)         |
-| DELETE | `/api/jobs/{id}`           | Cancel job                              |
-
-### 8.4 Bulk Parsing (`/api/bulk-*`)
-
-| Method | Endpoint                    | Description                         |
-|--------|-----------------------------|-------------------------------------|
-| POST   | `/api/bulk-parse`           | Stream-parse a folder (SSE)         |
-| POST   | `/api/bulk-scan`            | Scan folder → queue all files       |
-| POST   | `/api/bulk-scan-recursive`  | Recursive folder scan (SSE)         |
-| POST   | `/api/bulk-scan-ui`         | Scan uploads/ folder                |
-
-### 8.5 Experiments (`/api/experiments/*`)
-
-| Method | Endpoint                          | Description                       |
-|--------|-----------------------------------|-----------------------------------|
-| GET    | `/api/experiments`                | List (filterable by status)       |
-| POST   | `/api/experiments`                | Create new experiment             |
-| GET    | `/api/experiments/{id}`           | Full details + results            |
-| PUT    | `/api/experiments/{id}`           | Update with actual output         |
-| DELETE | `/api/experiments/{id}`           | Delete                            |
-| POST   | `/api/experiments/{id}/predict`   | Run LLM property prediction       |
-| POST   | `/api/experiments/{id}/suggest`   | LLM next-config suggestion        |
-| POST   | `/api/experiments/{id}/complete`  | Mark complete + score             |
-
-### 8.6 Chat (`/api/chat/*`)
-
-| Method | Endpoint                              | Description                       |
-|--------|---------------------------------------|-----------------------------------|
-| POST   | `/api/chat`                           | RAG chat (role + session)         |
-| GET    | `/api/chat/sessions`                  | List active sessions              |
-| GET    | `/api/chat/sessions/{id}/history`     | Conversation history              |
-| DELETE | `/api/chat/sessions/{id}`             | Clear session                     |
-
-### 8.7 Knowledge Search (`/api/search`, `/api/parsed/*`)
-
-| Method | Endpoint              | Description                              |
-|--------|-----------------------|------------------------------------------|
-| GET    | `/api/search?q=...`   | Semantic search in Qdrant                |
-| GET    | `/api/parsed`         | All Qdrant documents (flattened payload) |
-| GET    | `/api/parsed/{id}`    | Single Qdrant document                   |
-| DELETE | `/api/parsed/{id}`    | Delete from Qdrant                       |
-| GET    | `/api/stats`          | Document + experiment counts             |
+### Streaming
+Responses are streamed token-by-token via Server-Sent Events (SSE). The browser renders each token as it arrives — no waiting for the complete response.
 
 ---
 
-## 9. Codebase Map
+## 10. API Reference
 
-```
-E:\rlresearchassistant\
-│
-├── 📄 package.json              React/Tauri deps
-├── 📄 vite.config.js            Vite build config
-├── 📄 tsconfig.json             TypeScript config
-├── 📄 index.html                Tauri entry point
-│
-├── 📁 src/                      React frontend (8,108 lines total)
-│   ├── 📄 main.jsx              Vite entry → React.StrictMode
-│   ├── 📄 App.jsx               Root component (313 lines)
-│   │   ├── Loop state management (loopState, loopLoading)
-│   │   ├── Polling: /api/stats (5s), /api/loop/status (3s)
-│   │   └── Handler wiring: 5 loop handlers → real API calls
-│   ├── 📄 index.css             Alpine Lab design system (845 lines)
-│   │   ├── CSS custom properties (50+ tokens)
-│   │   ├── Glass panel styles + blur effects
-│   │   ├── Animations: fade-in, slide-in, pulse, spin, typewriter
-│   │   └── Component styles: cards, charts, approval row
-│   ├── 📄 mockData.js           Static demo data for all panels
-│   │
-│   └── 📁 components/
-│       ├── 📄 Sidebar.jsx           (96 lines) Nav + live status dots
-│       ├── 📄 GoalPanel.jsx         (144 lines) Goal + weights + loop
-│       ├── 📄 KnowledgePanel.jsx    (136 lines) Papers/insights (mock)
-│       ├── 📄 ExperimentDashboard.jsx(200 lines) Candidate cards
-│       ├── 📄 DecisionPanel.jsx     (222 lines) Typewriter + approve
-│       ├── 📄 ResultsPanel.jsx      (293 lines) Recharts radar + line
-│       ├── 📄 PapersView.jsx        (630 lines) Upload + Qdrant browser
-│       ├── 📄 ExperimentsPanel.jsx  (?)         Experiment history list
-│       ├── 📄 ChatPanel.jsx         (?)         RAG chat UI
-│       └── 📄 DocumentDetails.jsx   (?)         Document detail modal
-│
-├── 📁 src-tauri/                Tauri Rust shell
-│   └── 📄 tauri.conf.json       App: MatResOps, 1400×900, min 1000×700
-│
-├── 📁 backend/                  FastAPI backend (4,280+ lines Python)
-│   ├── 📄 main.py               (980 lines) 46 endpoints
-│   ├── 📄 orchestrator.py       (280 lines) Loop state machine ★ NEW
-│   ├── 📄 experiment_runner.py  (372 lines) Predict + score + suggest
-│   ├── 📄 chat.py               (240 lines) RAG chat + 3 personas
-│   ├── 📄 job_queue.py          (461 lines) Priority queue + worker
-│   ├── 📄 bulk_parser.py        (449 lines) Batch parse pipeline
-│   ├── 📄 extractor.py          (457 lines) TDS/paper LLM extraction
-│   ├── 📄 qdrant_mgr.py         (136 lines) Vector store wrapper
-│   ├── 📄 db.py                 (122 lines) DuckDB schema + init
-│   ├── 📄 llm.py                (149 lines) OllamaClient HTTP wrapper
-│   ├── 📄 parser.py             (208 lines) PDF text extraction
-│   ├── 📄 crawler.py            (111 lines) Recursive file scan
-│   ├── 📄 startup.py            (177 lines) Health check on boot
-│   ├── 📄 config.py             ( 21 lines) All config constants
-│   └── 📄 requirements.txt      Python dependencies
-│
-└── 📁 backend/data/
-    ├── 📄 research.db           DuckDB database
-    ├── 📁 uploads/              Uploaded PDFs staging area
-    ├── 📁 parsed/               Parsed output cache
-    └── 📁 qdrant_storage/       Local Qdrant persistence (if local mode)
-```
+All routes are at `http://localhost:8000`.
+
+### Documents
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/documents/upload` | Upload single PDF |
+| `GET` | `/api/documents` | List all documents |
+| `GET` | `/api/documents/{id}` | Get document with full payload |
+| `DELETE` | `/api/documents/{id}` | Delete single document |
+| `POST` | `/api/documents/bulk-delete` | Delete list of IDs (JSON array body) |
+| `POST` | `/api/documents/{id}/reprocess` | Re-run LLM extraction |
+
+### Jobs
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/jobs` | List all jobs |
+| `GET` | `/api/jobs/{id}` | Get single job |
+| `GET` | `/api/jobs/{id}/stream` | SSE job progress stream |
+| `DELETE` | `/api/jobs/{id}` | Cancel job |
+
+### Experiments
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/experiments` | List experiments |
+| `POST` | `/api/experiments` | Create experiment |
+| `GET` | `/api/experiments/{id}` | Get experiment detail |
+| `DELETE` | `/api/experiments/{id}` | Delete experiment |
+| `POST` | `/api/experiments/{id}/results` | Add test results |
+| `POST` | `/api/experiments/{id}/predict` | LLM property prediction |
+| `POST` | `/api/experiments/{id}/suggest` | Next config suggestions |
+| `POST` | `/api/experiments/{id}/complete` | Mark completed |
+
+### Research Loop
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/loop/status` | Current loop state |
+| `POST` | `/api/loop/start` | Start/reset loop |
+| `POST` | `/api/loop/iterate` | Run single iteration |
+| `POST` | `/api/loop/approve` | Approve + continue |
+| `POST` | `/api/loop/stop` | Stop loop |
+| `PUT` | `/api/loop/hypothesis` | Edit pending hypothesis text |
+
+### Chat
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/chat` | Send message (returns SSE stream) |
+| `GET` | `/api/chat/sessions` | List sessions |
+| `DELETE` | `/api/chat/sessions/{id}` | Clear session history |
+
+### System
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Ollama + Qdrant connectivity check |
+| `GET` | `/api/stats` | Document/experiment/chunk counts |
+| `POST` | `/api/folders/scan` | Trigger recursive folder crawl |
 
 ---
 
-## 10. Sprint Plan — Progress Tracker
+## 11. Project Phases
 
-*Original 7-day sprint. Current status: ~Day 6.5 complete.*
+### Phase 1 — Core Ingestion Pipeline ✅ Complete
 
-### ✅ Day 1 — Scaffold + Design System `[COMPLETE]`
-- [x] `create-tauri-app` → Tauri v2 + React + Vite project
-- [x] Alpine Lab CSS design system (50+ custom properties, glassmorphic cards)
-- [x] Sidebar with 6 nav items + keyboard navigation (arrow keys, ARIA)
-- [x] Empty panel layout with correct proportions
-- **Deliverable:** App opens, looks stunning, navigation works
+**Goal:** Get PDFs in, properties out, stored in Qdrant.
 
-### ✅ Day 2 — Full Static UI (Mock Data) `[COMPLETE]`
-- [x] GoalPanel with textarea + 3 weight sliders (Σ validation in real-time)
-- [x] KnowledgePanel — paper cards + insight chips (mock data)
-- [x] ExperimentDashboard — scored formulation cards with expandable detail
-- [x] ResultsPanel — Recharts radar chart + line trend chart
-- [x] DecisionPanel — typewriter animation reasoning + hypothesis card
-- [x] All 6 views routed: Research / Papers / Experiments / Results / Decisions / Chat
-- **Deliverable:** All panels populated, UX fully reviewable
-
-### ✅ Day 3 — PDF Ingestion + DuckDB `[COMPLETE]`
-- [x] Priority job queue (HIGH/MEDIUM/LOW by file size) + background worker thread
-- [x] pdfplumber + PyMuPDF dual extraction (table + text)
-- [x] DuckDB schema: documents, chunks, material_properties, experiments, results
-- [x] SHA-256 deduplication for batch ingestion
-- [x] Papers view: upload PDF → job queued → status tracked live
-- [x] SSE streaming job progress endpoint
-- [x] Drag & drop + folder upload in PapersView
-- **Deliverable:** Can upload a TDS, see extraction status in UI
-
-### ✅ Day 4 — Knowledge Pipeline (Embeddings + Qdrant) `[COMPLETE]`
-- [x] nomic-embed-text (768-dim) via Ollama — full GPU
-- [x] Qdrant collection `parsed_materials` with COSINE distance
-- [x] Chunk + embed pipeline (LangChain text splitters)
-- [x] Semantic search endpoint `/api/search?q=...`
-- [x] Qdrant browser in PapersView (flattened payload display) ← *fixed Apr 16*
-- [x] 22 vectors indexed from 8 TDS documents
-- **Deliverable:** Search returns real Qdrant results
-
-### ✅ Day 5 — Experiment Generator + Evaluation Engine `[COMPLETE]`
-- [x] Goal weights → composite scoring: `Σ strength(0.5) + flex(0.35) + cost(0.15)`
-- [x] `predict_properties()` — LLM predicts 6 mechanical properties from composition
-- [x] `calculate_composite_score()` — heuristic weighted scoring
-- [x] `suggest_next_configuration()` — LLM proposes 3 alternative configs
-- [x] Experiment CRUD + results table + predict/complete endpoints
-- [x] ExperimentDashboard wired to real candidates (normalization layer)
-- **Deliverable:** System generates and scores 3 formulation candidates
-
-### ✅ Day 6 — Decision Engine + Loop Wiring `[COMPLETE]`
-- [x] `orchestrator.py` — full loop state machine (idle/running/awaiting/stopped)
-- [x] 5-step pipeline: Retrieve → Generate → Evaluate → Decide → Persist
-- [x] LLM reasoning generation (why Config X won) + next_hypothesis
-- [x] Heuristic fallback at every LLM step (loop never crashes)
-- [x] 6 new API endpoints: `/api/loop/{start,iterate,approve,stop,hypothesis,status}`
-- [x] App.jsx handlers wired: all 5 console.log stubs → real API calls
-- [x] GoalPanel: sends `{active, goal, weights}` with toggle callback
-- [x] DecisionPanel: real data, inline hypothesis editor, loading states
-- [x] IterBadge: live iteration count + status from `/api/loop/status`
-- [x] Loop state polled every 3s; loading spinner during LLM inference
-- [x] Chat working (model mismatch fixed, `.format()` crash fixed) ← *fixed Apr 16*
-- **Deliverable:** Full closed loop works end-to-end ✅
-
-### 🔲 Day 7 — Polish + Scale Test `[IN PROGRESS / REMAINING]`
-
-#### Remaining tasks:
-
-**Critical:**
-- [ ] **Re-ingest TDS documents with 14b model** — current 22 vectors have empty `material_name` (parsed during model misconfiguration). Re-upload with correct model to populate material properties properly.
-- [ ] **Tauri sidecar integration** — FastAPI currently runs standalone. Need Tauri sidecar config so Python starts with the app and stops with it.
-- [ ] **Batch ingest 100+ TDS files** — run overnight to scale up knowledge base
-
-**High priority:**
-- [ ] **KnowledgePanel wire to real Qdrant** — currently shows mock papers/insights. Should call `/api/search` and `/api/parsed` with the current goal
-- [ ] **Dual Ollama client consolidation** — `llm.py` OllamaClient + LangChain OllamaEmbeddings both active. Risk: VRAM eviction on 4GB GPU. Unify to single client.
-- [ ] **Export decision log to PDF** — currently only JSON. pdfplumber or reportlab needed.
-
-**Nice to have (Day 8+):**
-- [ ] Multi-collection Qdrant — separate `tds_chunks` / `paper_insights` collections with relevance thresholding
-- [ ] Query rephrasing CRAG-style (from `kkarthikCRAG` codebase) for better RAG retrieval
-- [ ] Scientific reasoning persona (compliance/formulation expert) from `kkarthikCRAG`
-- [ ] Live radar chart animations on new iteration data
-- [ ] Tauri build → `.exe` installer for Windows
-- [ ] Multi-user auth layer (future company deployment)
+- [x] FastAPI backend skeleton (`main.py`, `config.py`)
+- [x] PDF text extraction (`parser.py` — pdfplumber + PyPDF2 fallback)
+- [x] LLM property extraction (`extractor.py` — TDS schema + Paper schema)
+- [x] Qdrant storage layer (`qdrant_store.py` — 8 collections designed and initialised)
+- [x] Background job queue with priority tiers by file size (`job_queue.py`)
+- [x] Job status persistence to Qdrant — survives backend restarts
+- [x] SHA-256 deduplication at crawl time
+- [x] Single PDF upload endpoint
+- [x] Folder scan endpoint (`crawler.py` — recursive, dedup-aware)
+- [x] `GET /api/documents` + `GET /api/documents/{id}` endpoints
+- [x] React frontend scaffolded (Vite + Tauri shell)
+- [x] `PapersView` — upload UI, job queue panel, documents table
 
 ---
 
-### Progress Summary
+### Phase 2 — Research Loop & Experiments ✅ Complete
 
-```
-Day 1   ████████████████████  100%  Scaffold + Design System
-Day 2   ████████████████████  100%  Full Static UI
-Day 3   ████████████████████  100%  PDF Ingestion + DuckDB
-Day 4   ████████████████████  100%  Knowledge Pipeline
-Day 5   ████████████████████  100%  Experiment Generator + Scoring
-Day 6   ████████████████████  100%  Decision Engine + Loop Wiring
-Day 7   █████████░░░░░░░░░░░   45%  Polish + Scale Test
-─────────────────────────────────────────────
-Overall ████████████████░░░░   92%  of 7-day sprint
-```
+**Goal:** Close the hypothesis → experiment → result cycle autonomously.
+
+- [x] Autonomous loop orchestrator (`orchestrator.py` — `idle / running / awaiting_approval / stopped` state machine)
+- [x] Experiment runner with LLM prediction and composite scoring (`experiment_runner.py`)
+- [x] Knowledge graph (`knowledge_graph.py` — NetworkX over Qdrant edges, 300s TTL cache)
+- [x] Graph-enhanced search (vector + PageRank + connectivity re-rank)
+- [x] `GoalPanel` — goal text input + weight sliders (Strength / Flexibility / Cost) + loop controls
+- [x] `DecisionPanel` — step progress bar + approve/stop + inline hypothesis edit
+- [x] `ExperimentDashboard` — compact experiment overview in Research view
+- [x] `ExperimentsPanel` — full experiments CRUD with create, view, add results, predict, suggest, complete, delete
+- [x] `ResultsPanel` — Recharts comparative visualisation (predicted vs actual)
+- [x] Human-in-the-loop approval gate (`AWAITING_APPROVAL` state)
 
 ---
 
-## 11. Running the System
+### Phase 3 — Chat & Knowledge Inspection ✅ Complete
+
+**Goal:** Make the knowledge base queryable in plain language.
+
+- [x] RAG chat engine (`chat.py` — LangChain + Qdrant + role system)
+- [x] Three expert roles with distinct system prompts
+- [x] SSE streaming responses — token-by-token delivery
+- [x] Session memory persisted to Qdrant `chat_sessions` collection
+- [x] `ChatPanel` — role selector, message history, streaming bubbles
+- [x] `KnowledgePanel` — graph summary view
+- [x] `DocumentDetails` modal — all tabs (Overview / Properties / Methodology / Key Findings / Limitations / Raw Data)
+- [x] Re-extraction (reprocess) flow — always refreshes UI regardless of result count
+- [x] `methodology`, `key_findings`, `processing_conditions`, `research_objective` fields extracted and stored in document manifest
+
+---
+
+### Phase 4 — Bug Fixes & Data Quality ✅ Complete
+
+**Goal:** Fix all known data pipeline and UI bugs discovered during internal testing.
+
+- [x] **Folder upload single-file bug** — `webkitdirectory` without `multiple` on Windows Chrome passed only the first file. Fixed by adding `multiple` attribute to the folder input.
+- [x] **Chat screen goes blank on send** — `Loader` component was used in `ChatPanel.jsx` but never imported. React render crashed silently when `loading=true`. Fixed by adding `Loader` to the lucide-react import.
+- [x] **Re-extract button no visible change** — three separate bugs: (1) conditional `if properties_extracted > 0` guard blocked refresh on empty results, (2) `extraction_status` vs `status` field name mismatch, (3) `llm_output` was never set in the non-Qdrant fetch path. All three fixed.
+- [x] **Methodology / findings / limitations not showing** — `upsert_document()` had no fields for these; `process_job()` never passed them. Fixed by extending both `upsert_document()` and `update_document_properties_count()` with all four research fields, and passing them from `process_job()`.
+- [x] **Bulk delete** — added `DELETE /api/documents/{id}` and `POST /api/documents/bulk-delete` endpoints. Added checkbox column with select-all to `PapersView` table; bulk delete button appears in header when rows are selected.
+
+---
+
+### Phase 5 — UI/UX Overhaul ✅ Complete
+
+**Goal:** Shift from sterile green palette to a modern, premium research tool aesthetic that feels alive rather than clinical.
+
+- [x] **Electric Indigo palette** — full `:root` token swap in `index.css`
+  - Primary accent: `#6d6af8` (Electric Indigo)
+  - Secondary accent: `#e8962a` (Warm Amber)
+  - Base background: `#07090f`
+  - Glass background: `rgba(13,18,32,0.60)` + `blur(20px)`
+  - Success/score-high states retain green (`#4db882`) — green means good, indigo means active
+  - Error/score-low shifted to `#e05555` (brighter, more legible)
+- [x] **Radial gradient body background** — subtle indigo ellipse at top-left + amber ellipse at bottom-right, gives depth without distraction
+- [x] **Heavy glassmorphism on panels** — `backdrop-filter: blur(20px)`, `box-shadow: 0 4px 24px rgba(0,0,0,0.4)`, 1px inset top-edge highlight (depth, not glow)
+- [x] **Frosted topbar** — `rgba(7,9,15,0.75)` background + `blur(20px)`, visually elevated above the workspace
+- [x] **Collapsible sidebar**
+  - CSS width transition: `0.25s cubic-bezier(0.4,0,0.2,1)`
+  - Expanded: `220px` / Collapsed: `56px`
+  - Label text, badges, logo text: `opacity: 0; width: 0; overflow: hidden` at collapsed state (smooth transition, not display:none)
+  - ChevronLeft / ChevronRight toggle button on the right edge
+  - State persisted in `localStorage` — survives page refresh
+  - Tooltips via `title` attribute on each nav item at collapsed state
+  - Expanded by default
+- [x] **Sidebar nav hover** — icon slides `2px` to the right on hover
+- [x] **Page transition animations** — `viewEnter` keyframe (0.22s fade+slide) on `activeNav` change. Wrapper uses `display: contents` to avoid adding a flex layer.
+- [x] **Stat card numbers** — `28px`, `font-weight: 800` (up from `12px`)
+- [x] **Topbar title** — `18px`, `font-weight: 700`
+- [x] **Experiments Kanban board** — 3-column layout replacing the flat card list
+  - `KanbanColumn` component: glass panel header with colour-coded title + count pill, independently scrollable body
+  - `KanbanCard`: 3px status-coloured left border, name + iter badge, material name (mono/muted), confidence bar for completed/failed, running pulse animation
+  - Column assignment: Queued (`pending`/`queued`), Running (`running`), Completed (`completed`/`failed`)
+  - Header bar: search input + total count + "New" button in one row (replaces the previous two-row controls block)
+
+---
+
+### Phase 6 — Chat Enhancement 🔲 Pending
+
+**Goal:** Upgrade chat from basic local RAG to a fully-capable research assistant with web awareness and better conversational intelligence.
+
+- [ ] **DuckDuckGo web search** (`backend/web_search.py`) — triggered on three tiers:
+  1. Explicit commands: `"search for..."`, `"look up..."`, `"find online..."`
+  2. Recency/live intent: `"latest"`, `"2024"`, `"recent developments"`, `"current"`
+  3. Discovery cues: `"find papers on"`, `"what is X"`, `"who invented"`
+- [ ] **Combined retrieval** — merge local Qdrant results + web results, deduplicate by content similarity, unified re-rank
+- [ ] **Query rephrasing before retrieval** — LLM resolves pronouns and implicit references in follow-up questions before the Qdrant search (e.g. `"what about its elongation?"` → `"EPDM rubber elongation at break"`)
+- [ ] **`<thinking>` tag stripping** — remove chain-of-thought XML tags from LLM output before streaming to the browser
+- [ ] **Memory window expansion** — 4 turns → 10 turns
+- [ ] **Two additional roles**:
+  - Document Parser — extraction quality review, JSON output inspection
+  - Document Analyst — cross-document comparison and contradiction detection
+- [ ] **Source citations in chat** — show which filenames/chunk positions each response drew from
+
+---
+
+### Phase 7 — Orchestrator Intelligence 🔲 Pending
+
+**Goal:** Replace the placeholder loop logic with genuinely intelligent hypothesis generation grounded in the knowledge base.
+
+- [ ] **Real LLM-driven hypothesis generation** — LLM reads current best experiment, full iteration history, and Qdrant context to generate a specific, justified next configuration (not random perturbation of previous values)
+- [ ] **Multi-candidate generation** — generate 5 candidates per iteration, score all, present top 3 with reasoning to user
+- [ ] **Iteration memory in LLM context** — full loop history (all hypotheses, scores, and outcomes) available to the LLM at each step
+- [ ] **Goal decomposition** — LLM breaks high-level research goal into sub-goals; tracks progress against each sub-goal across iterations
+- [ ] **Automatic result ingestion** — if an experiment result PDF is uploaded, parse it and automatically feed results back into the relevant experiment record without the manual "Add Result" step
+- [ ] **Loop history export** — export complete decision log (goal → hypotheses → scores → approvals → outcomes) as a structured PDF or JSON report
+
+---
+
+### Phase 8 — Multi-Model Routing 🔲 Pending
+
+**Goal:** Use the right model for each task rather than routing everything through one model.
+
+- [ ] **Orchestrator** — `qwen2.5:14b` for hypothesis generation (reasoning-intensive)
+- [ ] **Property extraction** — `qwen2.5:7b` for speed on structured JSON tasks
+- [ ] **Chat roles** — smaller models for structured reviewer tasks, larger for open-ended expert analysis
+- [ ] **Embedding alternatives** — evaluate `bge-m3` (multilingual) and `mxbai-embed-large` (higher accuracy) as alternatives to `nomic-embed-text`
+- [ ] **Settings panel** — hot-swap model selection in the UI without restarting the backend; model health check per-task
+
+---
+
+### Phase 9 — Desktop Application 🔲 Pending
+
+**Goal:** Package as a zero-install standalone desktop app for internal lab distribution.
+
+- [ ] **Tauri desktop shell** — Tauri is already scaffolded in the project (`@tauri-apps/cli` present); activate native window wrapper and system tray
+- [ ] **Auto-start backend** — Tauri sidecar launches FastAPI + Uvicorn on app open; graceful shutdown on close
+- [ ] **Auto-start Ollama** — check if Ollama is running; launch as a managed child process if not
+- [ ] **Bundled Qdrant** — embed Qdrant binary, launch on startup, shutdown on exit; no separate Qdrant install required for end users
+- [ ] **Windows installer** — NSIS-based `.exe` with all dependencies bundled
+- [ ] **First-run setup wizard** — model download progress, Qdrant initialisation, single test document ingestion to verify the pipeline
+- [ ] **Auto-update** — Tauri updater plugin pointing to internal release server for silent updates
+
+---
+
+## 12. Setup & Running
 
 ### Prerequisites
 
+| Requirement | Notes |
+|---|---|
+| Python 3.11+ | Backend runtime |
+| Node.js 18+ | Frontend build |
+| Ollama | Download from ollama.com; CUDA drivers recommended |
+| Qdrant | Run locally on port 6333 |
+| NVIDIA GPU | Optional but strongly recommended; CPU inference on 14b is very slow |
+
+### 1. Start Qdrant
+
 ```bash
-# 1. Start Qdrant (Docker)
-docker run -d -p 6333:6333 -p 6334:6334 \
-  -v "E:/rlresearchassistant/backend/data/qdrant_storage:/qdrant/storage:z" \
-  qdrant/qdrant
+# Docker (recommended)
+docker run -p 6333:6333 -v ./qdrant_storage:/qdrant/storage qdrant/qdrant
 
-# 2. Start Ollama (Windows — should already be in system tray)
-#    Verify models are available:
-ollama list
-# Should show: qwen2.5:14b-instruct-q4_K_S  nomic-embed-text  gemma3:4b  etc.
+# Or Qdrant binary directly on Windows
+qdrant.exe
+```
 
-# 3. If 14b model not pulled yet:
+### 2. Pull Ollama models
+
+```bash
 ollama pull qwen2.5:14b-instruct-q4_K_S
 ollama pull nomic-embed-text
 ```
 
-### Start the Backend
+### 3. Start the backend
 
 ```bash
-cd E:\rlresearchassistant\backend
-
-# Install dependencies (first time only)
+cd backend
 pip install -r requirements.txt
-
-# Start FastAPI (MUST be workers=1 for DuckDB)
-python -m uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1 --reload
-
-# Health check
-curl http://localhost:8000/health
-# Expected: {"status":"healthy","ollama":"running","qdrant":"connected"}
+python main.py
+# Listening on http://localhost:8000
 ```
 
-### Start the Frontend
+### 4. Start the frontend
 
 ```bash
-cd E:\rlresearchassistant
-
-# Install Node dependencies (first time only)
+# Project root
 npm install
-
-# Development mode (Vite hot-reload, no Tauri shell)
 npm run dev
-# → Open http://localhost:5173
-
-# Development mode WITH Tauri desktop window
-npm run tauri dev
-# → Opens native window at 1400×900
+# Opens http://localhost:5173
 ```
 
-### First-Time Data Setup
+### First-time Qdrant initialisation
+
+If Qdrant is freshly installed and collections do not exist yet:
 
 ```bash
-# Upload your TDS PDFs via the Papers view
-# OR use the bulk parse API directly:
-curl -X POST http://localhost:8000/api/bulk-parse \
-  -H "Content-Type: application/json" \
-  -d '{"folder_path": "E:\\path\\to\\your\\tds\\folder", "resume": true}'
-
-# Monitor progress via SSE stream (or watch the Papers view in the UI)
+cd backend
+python startup.py
 ```
 
-### Run the Research Loop
+---
 
-1. Open the app → navigate to **Research** view
-2. In **Goal Configuration**: type your research goal, set property weights
-3. Click **▶ Start Research Loop** (or **❯ Run 1 Iteration** for a single step)
-4. Wait for LLM inference (~30–90s for 14b model)
-5. Review the **Decision Reasoning** panel — winner, scoring, reasoning
-6. Click **✓ Approve & Continue** to run next iteration, or **✏ Edit Hypothesis** to adjust
-7. Repeat until satisfied, then **✕ Stop Loop**
+## 13. Directory Structure
+
+```
+rlresearchassistant/
+├── backend/
+│   ├── main.py               # FastAPI app + all API routes
+│   ├── config.py             # All constants (URLs, models, paths, collection names)
+│   ├── parser.py             # PDF → raw text (pdfplumber + PyPDF2)
+│   ├── extractor.py          # LLM property extraction (TDS + Paper schemas)
+│   ├── llm.py                # Ollama client wrapper
+│   ├── qdrant_store.py       # Storage abstraction (all 8 collections)
+│   ├── qdrant_mgr.py         # Higher-level search wrapper for RAG
+│   ├── job_queue.py          # Priority queue + background worker
+│   ├── orchestrator.py       # Autonomous loop state machine
+│   ├── experiment_runner.py  # LLM property prediction + composite scoring
+│   ├── knowledge_graph.py    # NetworkX graph over Qdrant edges
+│   ├── chat.py               # RAG chat engine + role system + session memory
+│   ├── crawler.py            # Recursive folder scanner with dedup
+│   ├── startup.py            # One-time Qdrant collection initialisation
+│   ├── bulk_parser.py        # CLI batch parser utility
+│   ├── refresh_system.py     # Re-index from cached JSON without re-running LLM
+│   ├── db.py                 # Legacy SQLite stub (unused, kept for import compat)
+│   └── data/
+│       ├── uploads/          # Temp upload staging area
+│       ├── parsed/           # Cached extracted JSON (for refresh_system.py)
+│       └── qdrant_storage/   # Qdrant on-disk vector storage
+│
+├── src/
+│   ├── App.jsx               # Root — routing, loop state, sidebar collapse state
+│   ├── index.css             # Full design system (CSS tokens, components, animations)
+│   └── components/
+│       ├── Sidebar.jsx           # Collapsible navigation sidebar
+│       ├── GoalPanel.jsx         # Research goal + weight sliders + loop controls
+│       ├── KnowledgePanel.jsx    # Knowledge graph summary panel
+│       ├── ExperimentDashboard.jsx  # Compact experiments summary (Research view)
+│       ├── ExperimentsPanel.jsx  # 3-column kanban board + modals
+│       ├── ResultsPanel.jsx      # Recharts comparative visualisation
+│       ├── DecisionPanel.jsx     # Loop step progress + approve + hypothesis edit
+│       ├── PapersView.jsx        # Document library, upload, bulk operations
+│       ├── DocumentDetails.jsx   # Document inspection modal (6 tabs)
+│       ├── ChatPanel.jsx         # RAG chat with role selector and SSE streaming
+│       └── CyberLoader.jsx       # Animated startup loading screen
+│
+├── public/
+│   └── favicon.svg
+├── dist/                     # Vite production build output
+├── vite.config.js
+├── package.json
+└── README.md
+```
 
 ---
 
-## 12. Known Issues & Limitations
+## 14. Known Limitations & Design Decisions
 
-| Issue | Severity | Status | Notes |
-|-------|----------|--------|-------|
-| DuckDB single-writer | ⚠️ Medium | Known | `uvicorn --workers 1` required |
-| Dual Ollama clients | ⚠️ Medium | Known | VRAM eviction risk on 4GB GPU |
-| No Tauri sidecar | 🔲 Low | Planned | FastAPI runs standalone |
-| Empty `material_name` in Qdrant | ℹ️ Info | Data issue | Re-ingest with correct model |
-| KnowledgePanel still mock | 🔲 Low | Planned | Day 7 task |
-| LLM response time 30–90s | ℹ️ Info | By design | 14b model on partial offload |
-| No authentication | 🔲 Low | Future | Single user for now |
+### LLM context window truncation
+The extractor sends only the first ~8000 characters of a document to the LLM. TDS documents longer than ~20 pages may have properties on later pages that are missed entirely. A chunked extraction strategy (process each chunk separately, then merge results) is planned for Phase 7.
 
----
+### Scanned-only PDFs
+No OCR is implemented. PDFs that are image-only (no text layer) will produce empty extraction results. `parser.py` logs a warning but does not fail the job — the document is indexed as a manifest with zero properties.
 
-## 13. Roadmap — What's Left
+### Single background worker
+One worker thread processes one document at a time. This is intentional — the RTX 3050 has 4GB VRAM, and running two LLM inference jobs simultaneously would cause OOM errors. Parallel extraction requires model offloading or a larger GPU.
 
-### Phase 7 (Current — Polish & Scale)
-- Tauri sidecar bundling (Python packaged with .exe)
-- Re-ingest TDS corpus with 14b model
-- KnowledgePanel wired to real Qdrant search
-- Export decision log to PDF
-- UI loading states + error boundaries
+### Chat session identity
+Chat sessions are identified by a client-generated UUID stored in React component state. If the browser tab is refreshed without persisting the session ID to `localStorage`, the active history is inaccessible (though still stored in Qdrant). A proper `localStorage`-backed session ID is a pending improvement.
 
-### Phase 8 (Post-Sprint — CRAG Merge from `kkarthikCRAG`)
-- **Relevance thresholding** — skip low-score chunks from RAG context
-- **Query rephrasing** — if retrieval score < 0.7, rephrase query and retry
-- **Multi-collection Qdrant** — `tds_chunks` / `paper_insights` separate namespaces
-- **Scientific reasoning** compliance persona (REACH, RoHS, ASTM references)
+### Knowledge graph rebuild latency
+The NetworkX graph is rebuilt from Qdrant every 300 seconds (5 minutes). Heavy document ingestion during a session means the graph may lag behind the actual collection state by up to 5 minutes. The TTL is configurable in `config.py`.
 
-### Phase 9 (Company Deployment)
-- Multi-user auth (JWT or OAuth2)
-- PostgreSQL migration from DuckDB
-- Shared Qdrant cluster (remote)
-- Role-based access: Researcher / Reviewer / Admin
-- Audit trail for all decisions
-- Tauri auto-updater
+### No authentication layer
+The platform has no authentication or authorisation. It is designed exclusively for single-user, local-network deployment. Exposing port 8000 to a wider network without adding an auth layer (e.g. OAuth2 + JWT via FastAPI's security utilities) would be a security risk.
 
----
+### LLM non-determinism in extraction
+Property extraction results can vary slightly between re-extraction runs on the same document. Temperature is set to 0 for extraction tasks, but GGUF runtime inference introduces minor sampling variance at low temperatures. Confidence scores should be treated as approximate indicators, not precise measurements.
 
-## Contributing & Development Notes
+### `db.py` / SQLite legacy
+An early prototype of this platform used SQLite (`research.db`) for all storage. It was replaced entirely by Qdrant. `db.py` remains in the codebase only because removing it would require auditing all imports. Nothing writes to `research.db`. It will be removed in a future cleanup pass.
 
-- **Single DuckDB writer**: never run with `--workers > 1`
-- **LLM calls are blocking** — orchestrator runs them in `asyncio.run_in_executor` to avoid starving the FastAPI event loop
-- **JSON mode safety**: always use `.replace("{context}", ...)` not `.format()` when building prompts — document text can contain `{}` (JSON, citations)
-- **Qdrant payload format**: LangChain stores metadata nested under a `"metadata"` key. The `get_all_documents()` flattener handles this transparently.
-- **Model keep_alive=-1**: models stay loaded in VRAM indefinitely — good for batch ingestion, bad if you need to switch models mid-session
-
----
-
-*Built for Planet Material Labs · April 2026 · MatResOps v0.1.0*  
-*Stack: Tauri v2 · React 18 · FastAPI 0.109 · Ollama · Qdrant · DuckDB · Python 3.10*
+### Tauri shell is dormant
+`@tauri-apps/cli` and `@tauri-apps/plugin-shell` are in `package.json`, and a `src-tauri/` directory exists. The Tauri shell is not yet activated — the app runs purely as a browser-based Vite dev server. Activating the desktop shell is Phase 9.

@@ -84,6 +84,22 @@ class ChatSession:
         self.messages: List[Dict[str, str]] = []
         self.created_at = datetime.now().isoformat()
 
+        # Try to load from Qdrant
+        self._load_from_qdrant()
+
+    def _load_from_qdrant(self):
+        """Load session from Qdrant if exists."""
+        try:
+            from qdrant_store import get_store
+
+            store = get_store()
+            saved = store.get_chat_session(self.session_id)
+            if saved and saved.get("messages"):
+                self.messages = saved["messages"]
+                self.created_at = saved.get("created_at", self.created_at)
+        except Exception:
+            pass  # In-memory fallback
+
     def add_message(self, role: str, content: str):
         self.messages.append(
             {"role": role, "content": content, "timestamp": datetime.now().isoformat()}
@@ -91,6 +107,19 @@ class ChatSession:
 
         if len(self.messages) > MAX_TURNS * 2:
             self.messages = self.messages[-(MAX_TURNS * 2) :]
+
+        # Persist to Qdrant
+        self._save_to_qdrant()
+
+    def _save_to_qdrant(self):
+        """Save session to Qdrant."""
+        try:
+            from qdrant_store import get_store
+
+            store = get_store()
+            store.upsert_chat_session(self.session_id, self.messages)
+        except Exception:
+            pass  # Silent fail - in-memory fallback
 
     def get_context(self) -> str:
         if not self.messages:
@@ -120,8 +149,9 @@ def get_or_create_session(session_id: str) -> ChatSession:
 
 def get_relevant_context(query: str, limit: int = 5) -> str:
     try:
-        qdrant = get_qdrant_manager()
-        results = qdrant.search(query=query, limit=limit)
+        from knowledge_graph import get_knowledge_graph
+        kg = get_knowledge_graph()
+        results = kg.graph_aware_search(query=query, k=limit)
 
         if not results:
             return "No relevant documents found in the knowledge base."
@@ -130,7 +160,9 @@ def get_relevant_context(query: str, limit: int = 5) -> str:
         for r in results:
             content = r.get("content", "")[:1000]
             filename = r.get("filename", "Unknown")
-            context_parts.append(f"[From {filename}]:\n{content}")
+            material = r.get("material_name", "")
+            header = f"[From {filename}]" + (f" — {material}" if material else "")
+            context_parts.append(f"{header}:\n{content}")
 
         return "\n\n---\n\n".join(context_parts)
     except Exception as e:
@@ -151,17 +183,19 @@ def generate_response(
     if include_context:
         context = get_relevant_context(query)
         try:
-            qdrant = get_qdrant_manager()
-            search_results = qdrant.search(query=query, limit=5)
+            from knowledge_graph import get_knowledge_graph
+            kg = get_knowledge_graph()
+            search_results = kg.graph_aware_search(query=query, k=5)
             sources = [
                 {
-                    "filename": r.get("filename"),
-                    "doc_type": r.get("doc_type"),
-                    "score": r.get("score"),
+                    "filename": r.get("filename", ""),
+                    "doc_type": r.get("doc_type", ""),
+                    "material_name": r.get("material_name", ""),
+                    "score": r.get("combined_score", r.get("score", 0)),
                 }
                 for r in search_results
             ]
-        except:
+        except Exception:
             pass
 
     session.add_message("user", query)
@@ -176,7 +210,9 @@ def generate_response(
     system_prompt = ROLE_PROMPTS.get(role, ROLE_PROMPTS["material-expert"])
     # Use replace() instead of .format() — context may contain { } from JSON/citations
     # which would cause KeyError with str.format()
-    full_prompt = system_prompt.replace("{context}", context_str).replace("{question}", query)
+    full_prompt = system_prompt.replace("{context}", context_str).replace(
+        "{question}", query
+    )
 
     try:
         from llm import get_client

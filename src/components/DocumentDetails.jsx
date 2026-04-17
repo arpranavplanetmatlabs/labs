@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { X, FileText, Loader, AlertCircle, CheckCircle, Clock, Info } from 'lucide-react';
+import { X, FileText, Loader, AlertCircle, CheckCircle, Clock, Info, RefreshCw } from 'lucide-react';
 
 const API_BASE = 'http://localhost:8000';
 
@@ -48,6 +48,8 @@ export default function DocumentDetails({ document, onClose }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [usePassedData, setUsePassedData] = useState(false);
+  const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessResult, setReprocessResult] = useState(null);
 
   useEffect(() => {
     if (document?.id) {
@@ -119,7 +121,19 @@ export default function DocumentDetails({ document, onClose }) {
         const res = await fetch(`${API_BASE}/api/documents/${document.id}`);
         if (res.ok) {
           const result = await res.json();
-          setData(result);
+          // Map API fields to component expectations + expose full response as raw data
+          setData({
+            ...result,
+            extraction_status: result.status || result.extraction_status || 'completed',
+            additional_data: {
+              key_findings: { content: result.key_findings || [] },
+              conditions: { content: result.processing_conditions || [] },
+              formulations: { content: result.formulations || [] },
+              limitations: { content: result.limitations || [] },
+              methodology: { content: result.methodology || '' },
+            },
+            llm_output: result,
+          });
         }
       }
     } catch (err) {
@@ -131,11 +145,28 @@ export default function DocumentDetails({ document, onClose }) {
 
   const getLoadingMessage = () => {
     if (usePassedData) return 'Loading...';
-    const status = data?.extraction_status || '';
+    const status = data?.extraction_status || data?.status || '';
     if (status === 'processing') return 'Extracting with AI...';
     if (status === 'queued') return 'Waiting in queue...';
-    if (status === 'completed') return 'Loading...';
     return 'Loading...';
+  };
+
+  const handleReprocess = async () => {
+    if (!document?.id) return;
+    setReprocessing(true);
+    setReprocessResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/documents/${document.id}/reprocess`, { method: 'POST' });
+      const result = await res.json();
+      setReprocessResult(result);
+      // Always refresh — even if 0 props, confidence/material_name may have changed
+      setUsePassedData(false);
+      await fetchDocumentDetails();
+    } catch (err) {
+      setReprocessResult({ error: err.message });
+    } finally {
+      setReprocessing(false);
+    }
   };
 
   const handleBackdropClick = (e) => {
@@ -190,11 +221,31 @@ export default function DocumentDetails({ document, onClose }) {
               </span>
               <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
                 <Clock size={10} />
-                {data?.extraction_status || 'Processing'}
+                {data?.extraction_status || data?.status || 'Processing'}
               </span>
               <ConfidenceBadge confidence={overallConfidence} />
             </div>
           </div>
+          <button
+            onClick={handleReprocess}
+            disabled={reprocessing}
+            title="Re-run AI extraction to populate properties"
+            style={{
+              background: reprocessing ? 'var(--glass-hover)' : 'transparent',
+              border: '1px solid var(--glass-border)',
+              borderRadius: 'var(--r-sm)',
+              padding: '6px 10px',
+              cursor: reprocessing ? 'not-allowed' : 'pointer',
+              color: reprocessResult?.properties_extracted > 0 ? 'var(--score-high)' : 'var(--text-muted)',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
+              fontSize: 11,
+            }}
+          >
+            <RefreshCw size={13} style={{ animation: reprocessing ? 'spin 1s linear infinite' : 'none' }} />
+            {reprocessing ? 'Extracting…' : reprocessResult?.properties_extracted != null ? `${reprocessResult.properties_extracted} props found` : 'Re-extract'}
+          </button>
           <button
             onClick={onClose}
             style={{
@@ -278,7 +329,7 @@ function PropertiesTab({ properties }) {
       <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>
         <AlertCircle size={48} style={{ opacity: 0.3, marginBottom: 12 }} />
         <div>No properties extracted yet</div>
-        <div style={{ fontSize: 11, marginTop: 4 }}>Properties will appear after AI extraction</div>
+        <div style={{ fontSize: 11, marginTop: 4 }}>Click <strong>Re-extract</strong> in the header to run AI extraction on this document</div>
       </div>
     );
   }

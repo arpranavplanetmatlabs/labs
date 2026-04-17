@@ -5,22 +5,18 @@ Features:
 - Property prediction using LLM
 - Composite scoring based on goals
 - Next configuration suggestions
-- Integration with Qdrant for context
+- Integration with Qdrant for context and storage
 """
 
 import json
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from langchain_ollama import OllamaLLM
 
-from config import OLLAMA_BASE, LLM_MODEL
+from config import LLM_MODEL
 from qdrant_mgr import get_qdrant_manager
-from db import get_connection
 
 
 class GoalWeights:
-    """Default goal weights for composite scoring"""
-
     DEFAULT = {"strength": 0.50, "flexibility": 0.35, "cost": 0.15}
 
     @classmethod
@@ -31,38 +27,29 @@ class GoalWeights:
 def predict_properties(
     material_name: str, composition: Dict[str, Any], conditions: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """
-    Use LLM to predict material properties based on composition.
-
-    Args:
-        material_name: Base material (e.g., "Polycarbonate", "EPDM")
-        composition: Dict with base polymer and additives with percentages
-        conditions: Processing conditions (temperature, pressure, time)
-
-    Returns:
-        Dict with predicted properties and confidence scores
-    """
+    """Use LLM to predict material properties from composition."""
     try:
-        # Get relevant context from Qdrant
         qdrant = get_qdrant_manager()
         context_results = qdrant.search(query=material_name, limit=3)
 
         context_text = ""
         if context_results:
-            context_parts = []
+            parts = []
             for r in context_results:
-                props = r.get("metadata", {}).get("properties", "No properties")
-                context_parts.append(
-                    f"Material: {r.get('filename')}\nProperties: {props[:500]}"
+                content = r.get("content", r.get("metadata", {}).get("properties", ""))[
+                    :500
+                ]
+                parts.append(
+                    f"Material: {r.get('filename', r.get('material_name', ''))}\nData: {content}"
                 )
-            context_text = "\n\n---\n\n".join(context_parts)
+            context_text = "\n\n---\n\n".join(parts)
 
         composition_str = json.dumps(composition, indent=2)
         conditions_str = (
             json.dumps(conditions, indent=2) if conditions else "Not specified"
         )
 
-        prompt = f"""You are a materials science expert. Based on the following material composition and processing conditions, predict the key mechanical properties.
+        prompt = f"""You are a materials science expert. Predict key mechanical properties for the following material.
 
 Context from knowledge base:
 {context_text}
@@ -74,28 +61,30 @@ Composition:
 Processing Conditions:
 {conditions_str}
 
-Predict the following properties (include confidence 0-1 for each):
-- tensile_strength_mpa: Tensile strength in MPa
-- elongation_percent: Elongation at break in %
-- tensile_modulus_mpa: Tensile modulus in MPa
-- flexural_modulus_mpa: Flexural modulus in MPa
-- impact_strength_kj_m2: Impact strength in kJ/m²
-- density_g_cm3: Density in g/cm³
+Predict these properties with confidence (0-1):
+- tensile_strength_mpa
+- elongation_percent
+- tensile_modulus_mpa
+- flexural_modulus_mpa
+- impact_strength_kj_m2
+- density_g_cm3
 
-Return JSON with predictions and confidence. Example format:
+Return JSON:
 {{
   "predictions": {{
     "tensile_strength_mpa": {{"value": 65, "confidence": 0.85}},
     "elongation_percent": {{"value": 120, "confidence": 0.80}},
-    ...
+    "tensile_modulus_mpa": {{"value": 2800, "confidence": 0.75}},
+    "flexural_modulus_mpa": {{"value": 2600, "confidence": 0.70}},
+    "impact_strength_kj_m2": {{"value": 45, "confidence": 0.65}},
+    "density_g_cm3": {{"value": 1.15, "confidence": 0.90}}
   }},
-  "reasoning": "Brief explanation of predictions"
+  "reasoning": "Brief explanation"
 }}"""
 
         from llm import get_client
 
         client = get_client()
-
         result = client.generate(
             model=LLM_MODEL,
             prompt=prompt,
@@ -105,29 +94,21 @@ Return JSON with predictions and confidence. Example format:
         )
         client.close()
 
+        # json_mode=True: result IS the parsed dict directly (not {"response": "..."})
         if result and isinstance(result, dict):
-            response = result.get("response", "")
-            # Try to parse JSON from response
-            try:
-                # Find JSON in response
-                if "{" in response:
-                    json_start = response.find("{")
-                    json_end = response.rfind("}") + 1
-                    json_str = response[json_start:json_end]
-                    predictions = json.loads(json_str)
-                    return {
-                        "status": "success",
-                        "predictions": predictions.get("predictions", {}),
-                        "reasoning": predictions.get("reasoning", ""),
-                        "context_used": len(context_results),
-                    }
-            except json.JSONDecodeError:
-                pass
+            predictions = result.get("predictions", {})
+            if predictions:
+                return {
+                    "status": "success",
+                    "predictions": predictions,
+                    "reasoning": result.get("reasoning", ""),
+                    "context_used": len(context_results),
+                }
 
         return {
             "status": "error",
             "error": "Failed to parse predictions",
-            "raw_response": str(result),
+            "raw": str(result),
         }
 
     except Exception as e:
@@ -139,47 +120,32 @@ def calculate_composite_score(
     expected_props: Dict[str, Any],
     weights: Dict[str, float] = None,
 ) -> Dict[str, Any]:
-    """
-    Calculate composite score based on predicted vs expected properties.
-
-    Args:
-        predicted_props: Dict of predicted property values
-        expected_props: Dict of target/expected property values
-        weights: Optional custom weights
-
-    Returns:
-        Dict with individual scores and composite score
-    """
     if weights is None:
         weights = GoalWeights.DEFAULT
 
     scores = {}
 
-    # Tensile strength score
     if (
         "tensile_strength_mpa" in predicted_props
         and "tensile_strength" in expected_props
     ):
-        pred = predicted_props["tensile_strength_mpa"].get("value", 0)
+        pred_val = predicted_props["tensile_strength_mpa"]
+        pred = (
+            pred_val.get("value", 0) if isinstance(pred_val, dict) else float(pred_val)
+        )
         expected = float(expected_props["tensile_strength"])
-        if expected > 0:
-            scores["strength"] = min(1.0, pred / expected)
-        else:
-            scores["strength"] = 0.5
+        scores["strength"] = min(1.0, pred / expected) if expected > 0 else 0.5
 
-    # Flexibility/elongation score
     if "elongation_percent" in predicted_props and "elongation" in expected_props:
-        pred = predicted_props["elongation_percent"].get("value", 0)
+        pred_val = predicted_props["elongation_percent"]
+        pred = (
+            pred_val.get("value", 0) if isinstance(pred_val, dict) else float(pred_val)
+        )
         expected = float(expected_props["elongation"])
-        if expected > 0:
-            scores["flexibility"] = min(1.0, pred / expected)
-        else:
-            scores["flexibility"] = 0.5
+        scores["flexibility"] = min(1.0, pred / expected) if expected > 0 else 0.5
 
-    # Cost score (inverted - lower is better, placeholder)
-    scores["cost"] = 0.7  # Default, would need actual cost data
+    scores["cost"] = 0.7  # Placeholder — no cost data available
 
-    # Calculate composite
     composite = (
         scores.get("strength", 0) * weights.get("strength", 0.5)
         + scores.get("flexibility", 0) * weights.get("flexibility", 0.35)
@@ -195,50 +161,28 @@ def calculate_composite_score(
 
 
 def suggest_next_configuration(
-    experiment_id: int,
+    experiment_id: Any,
     current_config: Dict[str, Any],
     results: Dict[str, Any],
     goal_statement: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Use LLM to suggest next experimental configurations based on results.
-
-    Args:
-        experiment_id: Current experiment ID
-        current_config: Current composition and conditions
-        results: Test results from the experiment
-        goal_statement: Research goal (e.g., "maximize tensile >45MPa")
-
-    Returns:
-        List of suggested configurations with rationale
-    """
     try:
         from llm import get_client
 
         client = get_client()
 
-        config_str = json.dumps(current_config, indent=2)
-        results_str = json.dumps(results, indent=2) if results else "No results yet"
-
         prompt = f"""You are a materials science expert helping design experiments.
-Based on the previous experiment results, suggest 3 alternative material configurations
-that might better achieve the research goal.
+Suggest 3 alternative material configurations to better achieve the research goal.
 
 Current Configuration:
-{config_str}
+{json.dumps(current_config, indent=2)}
 
 Experiment Results:
-{results_str}
+{json.dumps(results, indent=2) if results else "No results yet"}
 
 Research Goal: {goal_statement}
 
-For each suggested configuration provide:
-1. Composition changes (what to add/remove/adjust)
-2. Processing condition adjustments
-3. Expected improvement rationale
-4. Risk assessment (low/medium/high)
-
-Return JSON array. Example:
+Return JSON:
 {{
   "suggestions": [
     {{
@@ -247,8 +191,7 @@ Return JSON array. Example:
       "conditions": {{"temperature": 290}},
       "rationale": "Adding silica improves strength",
       "risk": "medium"
-    }},
-    ...
+    }}
   ]
 }}"""
 
@@ -261,17 +204,11 @@ Return JSON array. Example:
         )
         client.close()
 
+        # json_mode=True returns parsed dict directly
         if result and isinstance(result, dict):
-            response = result.get("response", "")
-            try:
-                if "{" in response:
-                    json_start = response.find("{")
-                    json_end = response.rfind("}") + 1
-                    json_str = response[json_start:json_end]
-                    suggestions = json.loads(json_str)
-                    return suggestions.get("suggestions", [])
-            except json.JSONDecodeError:
-                pass
+            suggestions = result.get("suggestions", [])
+            if suggestions:
+                return suggestions
 
         return []
 
@@ -280,93 +217,64 @@ Return JSON array. Example:
         return []
 
 
-def run_prediction_for_experiment(experiment_id: int) -> Dict[str, Any]:
-    """
-    Run full prediction pipeline for an experiment.
+def get_experiment_history(exp_id: Any) -> List[Dict[str, Any]]:
+    """Get experiment from Qdrant experiments collection."""
+    try:
+        from qdrant_store import get_store
 
-    Args:
-        experiment_id: ID of the experiment to predict for
-
-    Returns:
-        Prediction results including properties and scores
-    """
-    conn = get_connection()
-
-    # Get experiment details
-    exp = conn.execute(
-        "SELECT id, name, material_name, conditions, expected_output FROM experiments WHERE id = ?",
-        [experiment_id],
-    ).fetchone()
-
-    if not exp:
-        conn.close()
-        return {"status": "error", "error": f"Experiment {experiment_id} not found"}
-
-    exp_id, name, material_name, conditions_json, expected_output_json = exp
-
-    # Use experiment name as fallback if material_name is empty
-    effective_material = material_name or name or "Unknown Material"
-
-    conditions = json.loads(conditions_json) if conditions_json else {}
-    expected_output = json.loads(expected_output_json) if expected_output_json else {}
-
-    # Build composition from conditions (simplified - could be expanded)
-    composition = {
-        "base": effective_material,
-        "additives": [],
-        "notes": "Composition from experiment conditions",
-    }
-
-    # Get predictions
-    predictions = predict_properties(
-        material_name=effective_material,
-        composition=composition,
-        conditions=conditions,
-    )
-
-    # Calculate scores if we have predictions
-    score_result = {}
-    if predictions.get("status") == "success" and predictions.get("predictions"):
-        score_result = calculate_composite_score(
-            predicted_props=predictions["predictions"], expected_props=expected_output
-        )
-
-    conn.close()
-
-    return {
-        "experiment_id": experiment_id,
-        "predictions": predictions,
-        "scoring": score_result,
-        "timestamp": datetime.now().isoformat(),
-    }
-
-
-def get_experiment_history(experiment_id: int) -> List[Dict[str, Any]]:
-    """Get history of all predictions for an experiment."""
-    conn = get_connection()
-
-    # This would require a prediction_history table
-    # For now, return current state
-    exp = conn.execute(
-        "SELECT id, name, material_name, conditions, expected_output, actual_output, status, confidence_score, created_at FROM experiments WHERE id = ?",
-        [experiment_id],
-    ).fetchone()
-
-    conn.close()
-
-    if not exp:
+        store = get_store()
+        exps = store.get_recent_experiments(limit=100)
+        for exp in exps:
+            if exp.get("exp_id") == str(exp_id):
+                return [exp]
+        return []
+    except Exception as e:
+        print(f"get_experiment_history error: {e}")
         return []
 
-    return [
-        {
-            "id": exp[0],
-            "name": exp[1],
-            "material_name": exp[2],
-            "conditions": json.loads(exp[3]) if exp[3] else {},
-            "expected_output": json.loads(exp[4]) if exp[4] else {},
-            "actual_output": json.loads(exp[5]) if exp[5] else {},
-            "status": exp[6],
-            "confidence_score": exp[7],
-            "created_at": str(exp[8]),
+
+def run_prediction_for_experiment(exp_id: Any) -> Dict[str, Any]:
+    """Run prediction for an experiment stored in Qdrant."""
+    try:
+        from qdrant_store import get_store
+
+        store = get_store()
+        exps = store.get_recent_experiments(limit=100)
+
+        exp = None
+        for e in exps:
+            if e.get("exp_id") == str(exp_id):
+                exp = e
+                break
+
+        if not exp:
+            return {"status": "error", "error": f"Experiment {exp_id} not found"}
+
+        material_name = exp.get("material_name", "") or exp.get("name", "Unknown")
+        best = (
+            json.loads(exp.get("best_candidate", "{}"))
+            if isinstance(exp.get("best_candidate"), str)
+            else exp.get("best_candidate", {})
+        )
+
+        composition = best.get("composition", {"base": material_name, "additives": []})
+        conditions = best.get("processing", {})
+
+        predictions = predict_properties(material_name, composition, conditions)
+
+        score_result = {}
+        if predictions.get("status") == "success" and predictions.get("predictions"):
+            score_result = calculate_composite_score(
+                predicted_props=predictions["predictions"],
+                expected_props={"tensile_strength": 45, "elongation": 150},
+            )
+
+        return {
+            "experiment_id": exp_id,
+            "predictions": predictions,
+            "scoring": score_result,
+            "timestamp": datetime.now().isoformat(),
         }
-    ]
+
+    except Exception as e:
+        return {"status": "error", "error": str(e)}

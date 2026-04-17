@@ -13,13 +13,13 @@ Public API:
 """
 
 import json
+import uuid
 import threading
 import random
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from config import LLM_MODEL
-from db import get_connection
 from qdrant_mgr import get_qdrant_manager
 from experiment_runner import predict_properties, calculate_composite_score
 
@@ -175,15 +175,17 @@ class LoopOrchestrator:
 
     def _retrieve_context(self, goal: str, hypothesis: str) -> str:
         try:
-            qdrant = get_qdrant_manager()
+            from knowledge_graph import get_knowledge_graph
+            kg = get_knowledge_graph()
             query = f"{goal} {hypothesis}"[:300]
-            results = qdrant.search(query=query, limit=5)
+            results = kg.graph_aware_search(query=query, k=5)
             parts = []
             for r in results:
                 fname = r.get("filename", "unknown")
-                props = r.get("metadata", {}).get("properties", "")[:400]
-                parts.append(f"[{fname}] {props}")
-            return "\n".join(parts) if parts else "No relevant materials in knowledge base yet."
+                content = r.get("content", "")[:400]
+                material = r.get("material_name", "")
+                parts.append(f"[{fname}]{' — ' + material if material else ''}\n{content}")
+            return "\n\n".join(parts) if parts else "No relevant materials in knowledge base yet."
         except Exception as e:
             return f"Knowledge base unavailable: {e}"
 
@@ -392,49 +394,40 @@ Return JSON:
 
         return default_reasoning, default_next_hyp
 
-    def _persist(self, goal: str, candidates: List[Dict], best: Dict, reasoning: str, iteration: int) -> Optional[int]:
+    def _persist(self, goal: str, candidates: List[Dict], best: Dict, reasoning: str, iteration: int) -> Optional[str]:
         try:
-            conn = get_connection()
-            result = conn.execute(
-                """INSERT INTO experiments
-                   (name, material_name, description, conditions, expected_output,
-                    actual_output, status, result_analysis, confidence_score, recommendation)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
-                [
-                    f"Loop Iteration {iteration}",
-                    best.get("material_name", ""),
-                    goal,
-                    json.dumps(best.get("composition", {})),
-                    json.dumps({"tensile_strength": 45, "elongation": 150}),
-                    json.dumps(best.get("predicted", {})),
-                    "completed",
-                    reasoning,
-                    best.get("composite_score", 0),
-                    json.dumps([{
-                        "label": c.get("label"),
-                        "score": c.get("composite_score"),
-                        "material": c.get("material_name"),
-                    } for c in candidates]),
-                ],
-            ).fetchone()
-            conn.close()
-            return result[0] if result else None
+            from qdrant_store import get_store
+            store = get_store()
+            exp_id = str(uuid.uuid4())
+            store.upsert_experiment(
+                exp_id=exp_id,
+                name=f"Loop Iteration {iteration}",
+                goal=goal,
+                iteration=iteration,
+                material_name=best.get("material_name", ""),
+                candidates=candidates,
+                best_candidate=best,
+                reasoning=reasoning,
+                composite_score=best.get("composite_score", 0),
+            )
+            return exp_id
         except Exception as e:
             print(f"[Orchestrator] Persist error: {e}")
             return None
 
     def _get_past_results(self, limit: int = 3) -> List[Dict]:
         try:
-            conn = get_connection()
-            rows = conn.execute(
-                """SELECT name, material_name, confidence_score, result_analysis
-                   FROM experiments ORDER BY created_at DESC LIMIT ?""",
-                [limit],
-            ).fetchall()
-            conn.close()
+            from qdrant_store import get_store
+            store = get_store()
+            exps = store.get_recent_experiments(limit=limit)
             return [
-                {"name": r[0], "material": r[1], "score": r[2], "analysis": (r[3] or "")[:200]}
-                for r in rows
+                {
+                    "name": e.get("name", ""),
+                    "material": e.get("material_name", ""),
+                    "score": e.get("composite_score", 0),
+                    "analysis": e.get("reasoning", "")[:200],
+                }
+                for e in exps
             ]
         except Exception:
             return []

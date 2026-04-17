@@ -17,7 +17,7 @@ AVAILABLE_MODELS = [
 class OllamaClient:
     def __init__(self, base_url: str = OLLAMA_BASE):
         self.base_url = base_url
-        self.client = httpx.Client(timeout=120.0)
+        self.client = httpx.Client(timeout=300.0)
 
     def is_running(self) -> bool:
         try:
@@ -62,10 +62,10 @@ class OllamaClient:
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "num_gpu": 35,
-                "num_thread": 8,
+                "num_gpu": 99,   # offload all layers to GPU (3b fits in 4GB VRAM)
+                "num_ctx": 8192, # enough for 6000-char chunk + system prompt + thorough JSON response
             },
-            "keep_alive": -1,
+            "keep_alive": "15m",
         }
 
         if system:

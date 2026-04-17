@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { MessageSquare, Send, Loader, Trash2, FolderOpen, FileText } from 'lucide-react';
+import { MessageSquare, Send, Trash2, FolderOpen, FileText, Loader } from 'lucide-react';
+import CyberLoader from './CyberLoader';
 
 const API_BASE = 'http://localhost:8000';
 

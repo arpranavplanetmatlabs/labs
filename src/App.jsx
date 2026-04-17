@@ -15,6 +15,17 @@ const API_BASE = 'http://localhost:8000';
 export default function App() {
   const [activeNav, setActiveNav] = useState('research');
   const [selectedExp, setSelectedExp] = useState(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem('sidebar-collapsed') === 'true'
+  );
+
+  const handleToggleCollapse = useCallback(() => {
+    setSidebarCollapsed(prev => {
+      const next = !prev;
+      localStorage.setItem('sidebar-collapsed', String(next));
+      return next;
+    });
+  }, []);
   const [counts, setCounts] = useState({ documents: 0, tds: 0, papers: 0, experiments: 0, qdrant_parsed: 0 });
   const [loopState, setLoopState] = useState(null);   // null = not yet fetched
   const [loopLoading, setLoopLoading] = useState(false);
@@ -154,7 +165,13 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar active={activeNav} onNav={setActiveNav} counts={counts} />
+      <Sidebar
+        active={activeNav}
+        onNav={setActiveNav}
+        counts={counts}
+        collapsed={sidebarCollapsed}
+        onToggleCollapse={handleToggleCollapse}
+      />
 
       <div className="main-content">
         <div className="topbar">
@@ -171,6 +188,7 @@ export default function App() {
         </div>
 
         <div className="workspace">
+          <div key={activeNav} className="view-transition">
           {activeNav === 'research' && (
             <ResearchView
               loopState={loopState}
@@ -197,6 +215,7 @@ export default function App() {
             />
           )}
           {activeNav === 'chat'        && <ChatView />}
+          </div>
         </div>
       </div>
     </div>

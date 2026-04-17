@@ -1,457 +1,263 @@
+"""
+extractor.py — LLM-based property extraction from TDS and research papers.
+
+Schema (what the LLM must return, what extract_properties_list reads):
+  TDS:   {"material_name": str, "extraction_confidence": float,
+          "properties": [{"name": str, "value": any, "unit": str, "confidence": float, "context": str}],
+          "processing_conditions": [...]}
+  Paper: {"extraction_confidence": float,
+          "material_properties_mentioned": [{"property": str, "value": any, "unit": str, "confidence": float, "context": str}],
+          "key_findings": [...], "methodology": str}
+"""
+
 from typing import Dict, Any, List, Optional
 from llm import get_client, LLM_MODEL
 import json
 
-SYSTEM_PROMPT_TDS = """You are a materials science expert analyzing Technical Data Sheets (TDS).
-Extract ALL information from this document chunk. Be thorough and precise.
+# ── Prompts ────────────────────────────────────────────────────────────────────
+# Kept tight — 3b models choke on long system prompts.
 
-Return ONLY valid JSON with this structure:
+SYSTEM_PROMPT_TDS = """\
+You extract material properties from Technical Data Sheets.
+Return ONLY valid JSON. No markdown, no explanation.
+
+Output format:
 {
-    "material_name": "Name of the material if found",
-    "document_type": "tds",
-    "extraction_confidence": 0.0-1.0,
-    "properties": [
-        {"name": "Property Name", "value": number, "unit": "unit", "confidence": 0.0-1.0, "context": "brief context"}
-    ],
-    "processing_conditions": [
-        {"name": "Condition Name", "value": "value or description", "confidence": 0.0-1.0}
-    ],
-    "applications": ["list of applications mentioned"],
-    "handling_instructions": ["any handling or storage instructions"],
-    "raw_findings": "any other notable findings or data"
+  "material_name": "<name>",
+  "extraction_confidence": <0.0-1.0>,
+  "properties": [
+    {"name": "<property name>", "value": <number or string>, "unit": "<unit>", "confidence": <0.0-1.0>, "context": "<test standard or note>"}
+  ],
+  "processing_conditions": [
+    {"name": "<condition>", "value": "<value>", "confidence": <0.0-1.0>}
+  ]
 }
 
-IMPORTANT:
-- Return ONLY JSON, no other text
-- Include ALL numerical properties found in this chunk
-- If a value is from another chunk, note it in context
-- confidence should reflect how certain you are about the extraction"""
+Rules:
+- Extract ALL numerical properties (tensile, flexural, thermal, density, etc.)
+- Include test standard in context (ISO 527, ASTM D638, etc.)
+- value must be a number when the raw value is numeric
+- Return empty arrays if nothing found, never omit keys"""
 
-SYSTEM_PROMPT_PAPER = """You are a research assistant analyzing scientific papers about materials science.
-Extract ALL relevant information from this paper chunk. Be thorough.
+SYSTEM_PROMPT_PAPER = """\
+You extract material properties from research papers.
+Return ONLY valid JSON. No markdown, no explanation.
 
-Return ONLY valid JSON with this structure:
+Output format:
 {
-    "document_type": "paper",
-    "extraction_confidence": 0.0-1.0,
-    "research_objective": "main research goal",
-    "key_findings": [
-        {"finding": "description", "confidence": 0.0-1.0}
-    ],
-    "material_properties_mentioned": [
-        {"property": "property name", "value": number or "described value", "unit": "unit if numerical", "context": "where/how mentioned", "confidence": 0.0-1.0}
-    ],
-    "experimental_conditions": [
-        {"condition": "description", "confidence": 0.0-1.0}
-    ],
-    "formulations_tested": [
-        {"composition": "description", "results": "outcomes", "confidence": 0.0-1.0}
-    ],
-    "methodology": "brief description of experimental methods in this chunk",
-    "limitations_mentioned": [
-        {"limitation": "description", "confidence": 0.0-1.0}
-    ],
-    "future_work": ["any suggestions for future research"],
-    "raw_findings": "any other notable findings in this chunk"
+  "extraction_confidence": <0.0-1.0>,
+  "material_properties_mentioned": [
+    {"property": "<name>", "value": <number or string>, "unit": "<unit>", "confidence": <0.0-1.0>, "context": "<where mentioned>"}
+  ],
+  "key_findings": [
+    {"finding": "<description>", "confidence": <0.0-1.0>}
+  ],
+  "methodology": "<brief description>",
+  "research_objective": "<main goal>"
 }
 
-IMPORTANT:
-- Return ONLY JSON, no other text
-- Extract ALL material properties mentioned in this chunk
-- Include experimental conditions and methodology
-- Include limitations mentioned in this chunk"""
+Rules:
+- Extract every quantitative property mentioned
+- Include context showing where the value appears
+- Return empty arrays if nothing found, never omit keys"""
 
-CHUNK_SIZE = 6000
-CHUNK_OVERLAP = 500
-MAX_RETRIES = 3
+# ── Constants ──────────────────────────────────────────────────────────────────
 
-
-def _clean_llm_json(raw: str) -> Optional[dict]:
-    """Strip markdown fences, parse JSON."""
-    text = raw.strip()
-    if text.startswith("```json"):
-        text = text[7:]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    text = text.strip()
-    try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        return None
+# Feed only the property-rich section — TDS tables are front-loaded.
+# At 8192 ctx with the system prompt (~400 tok), we have ~7000 tok for text.
+# 4000 chars ~ 1000 tokens, so 6000 chars is safe.
+TDS_EXTRACT_CHARS = 6000
+PAPER_EXTRACT_CHARS = 8000
+CHUNK_SIZE = 4000       # each chunk well within context window
+CHUNK_OVERLAP = 300
+MAX_RETRIES = 1         # one retry max — fail fast
 
 
-def _split_text_into_chunks(text: str) -> List[str]:
-    """Simple text chunking with overlap."""
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _split_into_chunks(text: str) -> List[str]:
     if len(text) <= CHUNK_SIZE:
         return [text] if text.strip() else []
-
-    chunks = []
-    start = 0
-    text_len = len(text)
-
-    while start < text_len:
-        end = min(start + CHUNK_SIZE, text_len)
-        chunk = text[start:end]
-
-        if chunk.strip():
-            chunks.append(chunk)
-
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start:start + CHUNK_SIZE])
         start += CHUNK_SIZE - CHUNK_OVERLAP
-        if start >= text_len:
-            break
-
     return chunks
 
 
 def detect_document_type(text: str) -> str:
-    text_lower = text.lower()
-
-    tds_indicators = [
-        "typical properties",
-        "physical properties",
-        "mechanical properties",
-        "test method",
-        "iso ",
-        "astm ",
-        "ul94",
-        "iec ",
-        "tensile strength",
-        "density",
-        "shore hardness",
-        "melt temperature",
-        "mold temperature",
-        "technical data sheet",
-        "property",
-        "unit",
-        "specification",
-        "processing conditions",
-        "nominal",
-        "material grade",
-    ]
-
-    paper_indicators = [
-        "abstract",
-        "introduction",
-        "methodology",
-        "conclusion",
-        "references",
-        "doi:",
-        "journal",
-        "experiment",
-        "we investigated",
-        "results show",
-        "we observed",
-        "the authors",
-        "published",
-        "figure ",
-        "table ",
-        "et al.",
-        "according to",
-    ]
-
-    tds_score = sum(1 for ind in tds_indicators if ind in text_lower)
-    paper_score = sum(1 for ind in paper_indicators if ind in text_lower)
-
-    return "tds" if tds_score >= paper_score else "paper"
-
-
-def extract_from_text(text: str, doc_type: Optional[str] = None) -> Dict[str, Any]:
-    """Extract structured data from text using chunked LLM processing."""
-
-    if not text or not text.strip():
-        return _empty_result(doc_type or "paper", "Empty text provided")
-
-    if not doc_type:
-        doc_type = detect_document_type(text)
-
-    chunks = _split_text_into_chunks(text)
-
-    if not chunks:
-        return _empty_result(doc_type, "No text to process")
-
-    print(f"[EXTRACTOR] Processing {len(chunks)} chunk(s) for {doc_type}...")
-
-    system_prompt = SYSTEM_PROMPT_TDS if doc_type == "tds" else SYSTEM_PROMPT_PAPER
-
-    chunk_results = []
-    client = get_client()
-
-    for i, chunk_text in enumerate(chunks):
-        print(f"[EXTRACTOR] Processing chunk {i + 1}/{len(chunks)}...")
-
-        user_prompt = f"Extract all information from this {'TDS document' if doc_type == 'tds' else 'research paper'} (chunk {i + 1}/{len(chunks)}):\n\n{chunk_text}"
-
-        parsed = None
-        for attempt in range(MAX_RETRIES):
-            if attempt > 0:
-                print(
-                    f"[EXTRACTOR] Retry {attempt}/{MAX_RETRIES - 1} for chunk {i + 1}..."
-                )
-                chunk_text = chunk_text[: len(chunk_text) // 2]
-
-            result = client.generate(
-                model=LLM_MODEL,
-                prompt=user_prompt,
-                system=system_prompt,
-                temperature=0.1,
-                json_mode=True,
-            )
-
-            if result and isinstance(result, dict):
-                parsed = result
-                break
-
-        if parsed:
-            chunk_results.append(parsed)
-            print(
-                "[EXTRACTOR] Chunk {} extracted: {} properties".format(
-                    i + 1, len(parsed.get("properties", []))
-                )
-            )
-        else:
-            print(
-                "[EXTRACTOR] Chunk {} failed after {} attempts".format(
-                    i + 1, MAX_RETRIES
-                )
-            )
-
-    client.close()
-
-    if not chunk_results:
-        return _empty_result(doc_type, "All chunks failed to extract")
-
-    merged = _merge_chunk_results(chunk_results, doc_type)
-    merged["detected_type"] = doc_type
-    merged["chunks_processed"] = len(chunk_results)
-
-    return merged
+    lower = text.lower()
+    tds_hits = sum(1 for w in [
+        "typical properties", "mechanical properties", "physical properties",
+        "tensile strength", "flexural modulus", "iso ", "astm ", "ul94",
+        "density", "mold temperature", "technical data sheet", "processing conditions",
+        "nominal", "melt flow", "heat deflection", "shore hardness",
+    ] if w in lower)
+    paper_hits = sum(1 for w in [
+        "abstract", "introduction", "conclusion", "references", "doi:",
+        "et al.", "figure ", "table ", "we investigated", "results show",
+        "methodology", "characterization", "synthesis",
+    ] if w in lower)
+    return "tds" if tds_hits >= paper_hits else "paper"
 
 
 def _empty_result(doc_type: str, error: str = "") -> Dict[str, Any]:
     return {
         "document_type": doc_type,
+        "material_name": "",
         "extraction_confidence": 0.0,
         "error": error,
         "properties": [],
         "processing_conditions": [],
         "key_findings": [],
         "material_properties_mentioned": [],
-        "experimental_conditions": [],
         "methodology": "",
-        "limitations_mentioned": [],
+        "research_objective": "",
     }
 
 
-def _merge_chunk_results(chunk_results: List[dict], doc_type: str) -> Dict[str, Any]:
-    """Merge results from multiple chunks into single result."""
+def _merge_results(results: List[Dict], doc_type: str) -> Dict[str, Any]:
+    merged = _empty_result(doc_type)
+    seen = set()
+    total_conf, n = 0.0, 0
 
-    merged = {
-        "material_name": "",
-        "document_type": doc_type,
-        "extraction_confidence": 0.0,
-        "properties": [],
-        "processing_conditions": [],
-        "applications": [],
-        "handling_instructions": [],
-        "raw_findings": [],
-    }
-
-    if doc_type == "paper":
-        merged.update(
-            {
-                "research_objective": "",
-                "key_findings": [],
-                "material_properties_mentioned": [],
-                "experimental_conditions": [],
-                "formulations_tested": [],
-                "methodology": "",
-                "limitations_mentioned": [],
-                "future_work": [],
-            }
-        )
-
-    seen_properties = set()
-    total_confidence = 0.0
-    valid_chunks = 0
-
-    for chunk_result in chunk_results:
-        if not isinstance(chunk_result, dict):
+    for r in results:
+        if not isinstance(r, dict):
             continue
+        n += 1
+        total_conf += r.get("extraction_confidence", 0.5)
 
-        valid_chunks += 1
-        chunk_conf = chunk_result.get("extraction_confidence", 0.5)
-        total_confidence += chunk_conf
+        if r.get("material_name") and not merged["material_name"]:
+            merged["material_name"] = r["material_name"]
 
-        # Material Name
-        if chunk_result.get("material_name") and not merged["material_name"]:
-            merged["material_name"] = chunk_result["material_name"]
+        # TDS properties
+        for p in r.get("properties", []):
+            key = f"{p.get('name','')}-{p.get('value','')}"
+            if key not in seen and p.get("name"):
+                seen.add(key)
+                merged["properties"].append(p)
 
-        # Properties (TDS)
-        for prop in chunk_result.get("properties", []):
-            prop_key = f"{prop.get('name')}-{prop.get('value')}"
-            if prop_key not in seen_properties and prop.get("name"):
-                seen_properties.add(prop_key)
-                merged["properties"].append(prop)
+        for c in r.get("processing_conditions", []):
+            merged["processing_conditions"].append(c)
 
-        # Processing Conditions (TDS)
-        for cond in chunk_result.get("processing_conditions", []):
-            merged["processing_conditions"].append(cond)
+        # Paper properties
+        for p in r.get("material_properties_mentioned", []):
+            key = f"{p.get('property','')}-{p.get('value','')}"
+            if key not in seen and p.get("property"):
+                seen.add(key)
+                merged["material_properties_mentioned"].append(p)
 
-        # Applications
-        for app in chunk_result.get("applications", []):
-            if app not in merged["applications"]:
-                merged["applications"].append(app)
-
-        # Handling Instructions
-        for inst in chunk_result.get("handling_instructions", []):
-            if inst not in merged["handling_instructions"]:
-                merged["handling_instructions"].append(inst)
-
-        # Raw Findings (collect all)
-        raw = chunk_result.get("raw_findings", "")
-        if raw:
-            merged["raw_findings"].append(raw)
-
-        if doc_type == "paper":
-            # Research Objective
-            if chunk_result.get("research_objective") and not merged["research_objective"]:
-                merged["research_objective"] = chunk_result["research_objective"]
-
-            # Key Findings
-            for kf in chunk_result.get("key_findings", []):
+        for kf in r.get("key_findings", []):
+            if kf.get("finding"):
                 merged["key_findings"].append(kf)
 
-            # Material Properties Mentioned
-            for mp in chunk_result.get("material_properties_mentioned", []):
-                merged["material_properties_mentioned"].append(mp)
+        if r.get("methodology") and not merged["methodology"]:
+            merged["methodology"] = r["methodology"]
+        if r.get("research_objective") and not merged["research_objective"]:
+            merged["research_objective"] = r["research_objective"]
 
-            # Experimental Conditions
-            for ec in chunk_result.get("experimental_conditions", []):
-                merged["experimental_conditions"].append(ec)
+    merged["extraction_confidence"] = total_conf / n if n else 0.0
+    merged["document_type"] = doc_type
+    return merged
 
-            # Formulations Tested
-            for f in chunk_result.get("formulations_tested", []):
-                merged["formulations_tested"].append(f)
 
-            # Methodology
-            method = chunk_result.get("methodology", "")
-            if method:
-                if merged["methodology"]:
-                    merged["methodology"] += " " + method
-                else:
-                    merged["methodology"] = method
+# ── Public API ─────────────────────────────────────────────────────────────────
 
-            # Limitations
-            for lim in chunk_result.get("limitations_mentioned", []):
-                merged["limitations_mentioned"].append(lim)
+def extract_from_text(text: str, doc_type: Optional[str] = None) -> Dict[str, Any]:
+    """Extract structured data from text. Uses first N chars only — TDS tables are front-loaded."""
+    if not text or not text.strip():
+        return _empty_result(doc_type or "paper", "Empty text")
 
-            # Future Work
-            for fw in chunk_result.get("future_work", []):
-                if fw not in merged["future_work"]:
-                    merged["future_work"].append(fw)
+    if not doc_type:
+        doc_type = detect_document_type(text)
 
-    merged["extraction_confidence"] = (
-        total_confidence / valid_chunks if valid_chunks > 0 else 0.0
-    )
-    merged["properties_count"] = len(merged["properties"])
-    merged["raw_findings"] = "\n".join(merged["raw_findings"]) if merged["raw_findings"] else ""
+    max_chars = TDS_EXTRACT_CHARS if doc_type == "tds" else PAPER_EXTRACT_CHARS
+    extract_text = text[:max_chars]
 
+    chunks = _split_into_chunks(extract_text)
+    if not chunks:
+        return _empty_result(doc_type, "No text to process")
+
+    print(f"[EXTRACTOR] {doc_type.upper()} | {len(text)} chars -> {len(extract_text)} chars | {len(chunks)} chunk(s)")
+
+    system_prompt = SYSTEM_PROMPT_TDS if doc_type == "tds" else SYSTEM_PROMPT_PAPER
+    results = []
+    client = get_client()
+
+    for i, chunk in enumerate(chunks):
+        print(f"[EXTRACTOR] Chunk {i+1}/{len(chunks)}...")
+        parsed = None
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                chunk = chunk[:len(chunk) // 2]  # halve on retry
+            result = client.generate(
+                model=LLM_MODEL,
+                prompt=chunk,
+                system=system_prompt,
+                temperature=0.0,
+                json_mode=True,
+            )
+            if result and isinstance(result, dict) and "raw_text" not in result:
+                parsed = result
+                break
+        if parsed:
+            n_props = len(parsed.get("properties", [])) + len(parsed.get("material_properties_mentioned", []))
+            print(f"[EXTRACTOR] Chunk {i+1} OK — {n_props} props")
+            results.append(parsed)
+        else:
+            print(f"[EXTRACTOR] Chunk {i+1} FAILED")
+
+    client.close()
+
+    if not results:
+        return _empty_result(doc_type, "All chunks failed")
+
+    merged = _merge_results(results, doc_type)
+    merged["chunks_processed"] = len(results)
     return merged
 
 
 def extract_properties_list(extraction_result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    properties = []
+    """Flatten merged extraction result into a list of property dicts for upsert_property()."""
+    props = []
 
-    for prop in extraction_result.get("properties", []):
-        properties.append(
-            {
-                "property_name": prop.get("name", "Unknown"),
-                "value": prop.get("value"),
-                "unit": prop.get("unit", ""),
-                "confidence": prop.get("confidence", 0.5),
-                "context": prop.get("context", ""),
-                "extraction_method": "llm",
-            }
-        )
+    for p in extraction_result.get("properties", []):
+        if p.get("name") and p.get("value") is not None:
+            props.append({
+                "property_name": p["name"],
+                "value": p["value"],
+                "unit": p.get("unit", ""),
+                "confidence": p.get("confidence", 0.5),
+                "context": p.get("context", ""),
+            })
 
-    for prop in extraction_result.get("material_properties_mentioned", []):
-        properties.append(
-            {
-                "property_name": prop.get("property", "Unknown"),
-                "value": prop.get("value"),
-                "unit": prop.get("unit", ""),
-                "confidence": prop.get("confidence", 0.5),
-                "context": prop.get("context", ""),
-                "extraction_method": "llm",
-            }
-        )
+    for p in extraction_result.get("material_properties_mentioned", []):
+        if p.get("property") and p.get("value") is not None:
+            props.append({
+                "property_name": p["property"],
+                "value": p["value"],
+                "unit": p.get("unit", ""),
+                "confidence": p.get("confidence", 0.5),
+                "context": p.get("context", ""),
+            })
 
-    return properties
+    return props
 
 
 def extract_additional_data(extraction_result: Dict[str, Any]) -> Dict[str, Any]:
-    data = {}
-
-    data["extraction_confidence"] = extraction_result.get("extraction_confidence", 0.5)
-    data["research_objective"] = extraction_result.get("research_objective", "")
-    data["methodology"] = extraction_result.get("methodology", "")
-    data["material_name"] = extraction_result.get("material_name", "")
-    data["applications"] = extraction_result.get("applications", [])
-    data["handling_instructions"] = extraction_result.get("handling_instructions", [])
-    data["future_work"] = extraction_result.get("future_work", [])
-    data["comparison_with_other_materials"] = extraction_result.get(
-        "comparison_with_other_materials", ""
-    )
-    data["raw_findings"] = extraction_result.get("raw_findings", "")
-
-    key_findings = []
-    for kf in extraction_result.get("key_findings", []):
-        key_findings.append(
-            {"finding": kf.get("finding", ""), "confidence": kf.get("confidence", 0.5)}
-        )
-    data["key_findings"] = key_findings
-
-    conditions = []
-    for c in extraction_result.get("processing_conditions", []):
-        conditions.append(
-            {
-                "name": c.get("name", ""),
-                "value": c.get("value", ""),
-                "confidence": c.get("confidence", 0.5),
-            }
-        )
-    for c in extraction_result.get("experimental_conditions", []):
-        conditions.append(
-            {
-                "name": c.get("condition", ""),
-                "value": "",
-                "confidence": c.get("confidence", 0.5),
-            }
-        )
-    data["conditions"] = conditions
-
-    formulations = []
-    for f in extraction_result.get("formulations_tested", []):
-        formulations.append(
-            {
-                "composition": f.get("composition", ""),
-                "results": f.get("results", ""),
-                "confidence": f.get("confidence", 0.5),
-            }
-        )
-    data["formulations"] = formulations
-
-    limitations = []
-    for l in extraction_result.get("limitations_mentioned", []):
-        limitations.append(
-            {
-                "limitation": l.get("limitation", ""),
-                "confidence": l.get("confidence", 0.5),
-            }
-        )
-    data["limitations"] = limitations
-
-    return data
+    """Map merged result to the shape DocumentDetails expects."""
+    conditions = [
+        {"name": c.get("name", ""), "value": c.get("value", ""), "confidence": c.get("confidence", 0.5)}
+        for c in extraction_result.get("processing_conditions", [])
+    ]
+    return {
+        "extraction_confidence": extraction_result.get("extraction_confidence", 0.0),
+        "research_objective": extraction_result.get("research_objective", ""),
+        "methodology": extraction_result.get("methodology", ""),
+        "material_name": extraction_result.get("material_name", ""),
+        "key_findings": extraction_result.get("key_findings", []),
+        "conditions": conditions,
+        "formulations": [],
+        "limitations": [],
+        "raw_findings": extraction_result.get("raw_findings", ""),
+    }

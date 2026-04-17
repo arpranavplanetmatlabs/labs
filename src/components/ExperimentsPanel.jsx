@@ -166,8 +166,9 @@ export default function ExperimentsPanel({ onSelect, onCreateNew }) {
     (exp.material_name && exp.material_name.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
-  const pendingCount = experiments.filter(e => e.status === 'pending').length;
-  const completedCount = experiments.filter(e => e.status === 'completed').length;
+  const queued    = filteredExps.filter(e => e.status === 'pending' || e.status === 'queued');
+  const running   = filteredExps.filter(e => e.status === 'running');
+  const completed = filteredExps.filter(e => e.status === 'completed' || e.status === 'failed');
 
   if (loading) {
     return (
@@ -178,64 +179,58 @@ export default function ExperimentsPanel({ onSelect, onCreateNew }) {
   }
 
   return (
-    <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%', position: 'relative' }}>
-      <div className="panel-header">
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', position: 'relative', gap: 0 }}>
+      {/* Header bar */}
+      <div className="glass-panel" style={{ padding: '10px 16px', display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
         <FlaskConical size={14} style={{ color: 'var(--accent)' }} />
         <span className="panel-title">Experiments</span>
-        <span className="ml-auto" style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+        <input
+          type="text"
+          placeholder="Search…"
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          style={{
+            flex: 1, maxWidth: 260,
+            background: 'var(--bg-overlay)',
+            border: '1px solid var(--glass-border)',
+            borderRadius: 'var(--r-md)',
+            padding: '5px 10px',
+            color: 'var(--text-primary)',
+            fontSize: 12,
+            marginLeft: 8,
+          }}
+        />
+        <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginLeft: 'auto' }}>
           {experiments.length} total
         </span>
+        <button className="btn btn-primary btn-sm" onClick={() => setShowCreateModal(true)} title="Create new experiment">
+          <Plus size={12} /> New
+        </button>
       </div>
 
-      <div style={{ padding: '8px 12px', borderBottom: '1px solid var(--glass-border)' }}>
-        <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
-          <input
-            type="text"
-            placeholder="Search experiments..."
-            value={searchQuery}
-            onChange={e => setSearchQuery(e.target.value)}
-            style={{
-              flex: 1,
-              background: 'var(--glass-bg)',
-              border: '1px solid var(--glass-border)',
-              borderRadius: 'var(--r-md)',
-              padding: '6px 10px',
-              color: 'var(--text-primary)',
-              fontSize: 12,
-            }}
-          />
-          <button className="btn btn-primary btn-sm" onClick={() => setShowCreateModal(true)} title="Create new experiment">
-            <Plus size={12} />
-          </button>
-        </div>
-        <div style={{ display: 'flex', gap: 12, fontSize: 11 }}>
-          <span style={{ color: 'var(--text-muted)' }}>
-            Pending: <strong style={{ color: 'var(--text-secondary)' }}>{pendingCount}</strong>
-          </span>
-          <span style={{ color: 'var(--text-muted)' }}>
-            Completed: <strong style={{ color: 'var(--score-high)' }}>{completedCount}</strong>
-          </span>
-        </div>
-      </div>
-
-      <div className="panel-body scroll-area" style={{ height: 'calc(100% - 120px)' }}>
-        {filteredExps.length === 0 ? (
-          <div style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>
-            <FlaskConical size={32} style={{ marginBottom: 12, opacity: 0.5 }} />
-            <div style={{ fontSize: 13 }}>No experiments found</div>
-            <div style={{ fontSize: 11, marginTop: 4 }}>Click + to create a new experiment</div>
-          </div>
-        ) : (
-          filteredExps.map(exp => (
-            <ExperimentCard
-              key={exp.id}
-              exp={exp}
-              isExpanded={expanded === exp.id}
-              onToggle={() => setExpanded(expanded === exp.id ? null : exp.id)}
-              onSelect={() => handleSelect(exp)}
-            />
-          ))
-        )}
+      {/* Kanban board */}
+      <div className="kanban-board" style={{ flex: '1 1 0', minHeight: 0, marginTop: 12 }}>
+        <KanbanColumn
+          title="Queued"
+          count={queued.length}
+          headerColor="var(--text-muted)"
+          experiments={queued}
+          onSelect={handleSelect}
+        />
+        <KanbanColumn
+          title="Running"
+          count={running.length}
+          headerColor="var(--accent)"
+          experiments={running}
+          onSelect={handleSelect}
+        />
+        <KanbanColumn
+          title="Completed"
+          count={completed.length}
+          headerColor="var(--score-high)"
+          experiments={completed}
+          onSelect={handleSelect}
+        />
       </div>
 
       {showCreateModal && (
@@ -262,49 +257,89 @@ export default function ExperimentsPanel({ onSelect, onCreateNew }) {
   );
 }
 
-function ExperimentCard({ exp, isExpanded, onToggle, onSelect }) {
-  const statusIcon = STATUS_ICON[exp.status] || STATUS_ICON.pending;
+function KanbanColumn({ title, count, headerColor, experiments, onSelect }) {
+  return (
+    <div className="kanban-col">
+      <div className="kanban-col-header">
+        <span style={{ color: headerColor, fontWeight: 700, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.8px' }}>
+          {title}
+        </span>
+        <span style={{
+          background: 'var(--bg-overlay)', border: '1px solid var(--glass-border)',
+          borderRadius: 10, padding: '1px 7px', fontSize: 10,
+          color: 'var(--text-muted)', fontFamily: 'var(--font-mono)',
+        }}>
+          {count}
+        </span>
+      </div>
+      <div className="kanban-col-body">
+        {experiments.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '24px 0', color: 'var(--text-muted)', fontSize: 11, opacity: 0.6 }}>
+            Empty
+          </div>
+        ) : (
+          experiments.map(exp => (
+            <KanbanCard key={exp.id} exp={exp} onSelect={() => onSelect(exp)} />
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function KanbanCard({ exp, onSelect }) {
   const confidence = exp.confidence || 0;
+  const confPct = Math.round(confidence * 100);
+  const isRunning = exp.status === 'running';
+  const isFailed = exp.status === 'failed';
+
+  const statusClass = isRunning ? 'status-running'
+    : isFailed ? 'status-failed'
+    : exp.status === 'completed' ? 'status-completed'
+    : 'status-queued';
 
   return (
-    <div
-      className="exp-card anim-fade-in"
-      style={{
-        padding: '12px',
-        borderRadius: 'var(--r-md)',
-        background: isExpanded ? 'var(--glass-active)' : 'var(--glass-bg)',
-        border: '1px solid var(--glass-border)',
-        cursor: 'pointer',
-        transition: 'all 0.15s ease',
-      }}
-      onClick={onToggle}
-    >
-      <div className="flex items-center gap-sm">
-        {statusIcon}
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text-primary)' }}>{exp.name}</div>
-          {exp.material_name && (
-            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{exp.material_name}</div>
-          )}
+    <div className={`kanban-card ${statusClass}`} onClick={onSelect}>
+      {/* Top row: name + iter badge */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 6, marginBottom: 4 }}>
+        <div style={{ fontWeight: 600, fontSize: 12, color: 'var(--text-primary)', lineHeight: 1.3, flex: 1 }}>
+          {exp.name}
         </div>
-        <div style={{
-          fontSize: 11,
-          fontFamily: 'var(--font-mono)',
-          color: SCORE_COLOR(confidence),
-        }}>
-          {exp.status === 'completed' ? `${Math.round(confidence * 100)}%` : exp.status}
-        </div>
+        {exp.iteration != null && exp.iteration > 0 && (
+          <span className="kanban-iter-badge">Iter {exp.iteration}</span>
+        )}
       </div>
 
-      {isExpanded && exp.material_name && (
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--glass-border)' }}>
-          <button
-            className="btn btn-secondary btn-sm"
-            style={{ width: '100%' }}
-            onClick={(e) => { e.stopPropagation(); onSelect(); }}
-          >
-            View Details
-          </button>
+      {/* Material name */}
+      {exp.material_name && (
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginBottom: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {exp.material_name}
+        </div>
+      )}
+
+      {/* Confidence bar (only for completed/failed) */}
+      {(exp.status === 'completed' || exp.status === 'failed') && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div className="kanban-conf-bar">
+            <div
+              className="kanban-conf-fill"
+              style={{
+                width: `${confPct}%`,
+                background: isFailed ? 'var(--score-low)' : SCORE_COLOR(confidence),
+              }}
+            />
+          </div>
+          <span className="kanban-conf-label" style={{ color: isFailed ? 'var(--score-low)' : SCORE_COLOR(confidence) }}>
+            {confPct}%
+          </span>
+        </div>
+      )}
+
+      {/* Running indicator */}
+      {isRunning && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginTop: 4 }}>
+          <Loader size={10} style={{ color: 'var(--accent)', animation: 'spin 1s linear infinite' }} />
+          <span style={{ fontSize: 10, color: 'var(--accent)', fontFamily: 'var(--font-mono)' }}>Running…</span>
         </div>
       )}
     </div>
