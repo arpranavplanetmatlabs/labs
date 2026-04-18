@@ -195,31 +195,61 @@ function LoopProgressBar({ activeStep, isRunning }) {
 function WinnerChip({ exp }) {
   if (!exp) return null;
   const score = exp.composite_score ?? exp.confidence_score ?? 0;
+  const surrogateKeys = Object.keys(exp.surrogate_predictions ?? {});
+  const hasGP = surrogateKeys.length > 0;
+  // Legacy fallback
   const tensile = exp.predicted?.tensile_strength ?? exp.scores?.strength;
   const elong   = exp.predicted?.elongation ?? exp.scores?.flexibility;
+
   return (
     <div style={{
       background: 'linear-gradient(135deg, rgba(58,146,104,0.12), rgba(58,146,104,0.04))',
       border: '1px solid var(--tag-tds-border)',
       borderRadius: 'var(--r-md)', padding: '10px 16px',
-      display: 'flex', alignItems: 'center', gap: 12,
     }}>
-      <span style={{ fontSize: 22 }}>🏆</span>
-      <div>
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: 2 }}>
-          Selected Configuration
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: hasGP ? 10 : 0 }}>
+        <span style={{ fontSize: 22 }}>🏆</span>
+        <div>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: 2 }}>
+            Selected Configuration
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
+            {exp.label ?? exp.name ?? 'Best Config'}
+            <span style={{ marginLeft: 12, fontFamily: 'var(--font-mono)', fontSize: 18, color: 'var(--score-high)' }}>
+              {typeof score === 'number' ? score.toFixed(3) : 'N/A'}
+            </span>
+          </div>
         </div>
-        <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text-primary)' }}>
-          {exp.label ?? exp.name ?? 'Best Config'}
-          <span style={{ marginLeft: 12, fontFamily: 'var(--font-mono)', fontSize: 18, color: 'var(--score-high)' }}>
-            {typeof score === 'number' ? score.toFixed(3) : 'N/A'}
-          </span>
+        {!hasGP && (
+          <div className="flex gap-sm ml-auto">
+            {tensile != null && <MiniProp label="Tensile" value={`${typeof tensile === 'number' ? tensile.toFixed(1) : tensile} MPa`} ok={tensile >= 45} />}
+            {elong   != null && <MiniProp label="Elong."  value={`${typeof elong === 'number' ? elong.toFixed(0) : elong}%`} ok={elong >= 150} />}
+          </div>
+        )}
+      </div>
+
+      {/* GP surrogate predictions with uncertainty */}
+      {hasGP && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 10 }}>
+          {surrogateKeys.map(name => {
+            const pred = exp.surrogate_predictions[name];
+            return (
+              <div key={name} style={{ background: 'var(--glass-bg)', borderRadius: 6, padding: '8px 10px' }}>
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 4 }}>{name.replace(/_/g,' ')}</div>
+                <UncertaintyBar mean={pred?.mean ?? pred} std={pred?.std ?? 0} unit={pred?.unit ?? ''} trained={pred?.trained !== false} />
+              </div>
+            );
+          })}
         </div>
-      </div>
-      <div className="flex gap-sm ml-auto">
-        {tensile != null && <MiniProp label="Tensile" value={`${typeof tensile === 'number' ? tensile.toFixed(1) : tensile} MPa`} ok={tensile >= 45} />}
-        {elong   != null && <MiniProp label="Elong."  value={`${typeof elong   === 'number' ? elong.toFixed(0)   : elong}%`}      ok={elong >= 150}  />}
-      </div>
+      )}
+
+      {/* Acquisition reasoning */}
+      {exp.acquisition_score > 0 && (
+        <div style={{ marginTop: 8, fontSize: 10, color: '#a78bfa', display: 'flex', alignItems: 'flex-start', gap: 4 }}>
+          <span>⚡</span>
+          <span>EI: {exp.acquisition_score?.toFixed(3)} — {exp.hypothesis?.slice(0, 120)}</span>
+        </div>
+      )}
     </div>
   );
 }

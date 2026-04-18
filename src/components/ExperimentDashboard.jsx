@@ -1,19 +1,16 @@
 import { useState } from 'react';
-import { FlaskConical, ChevronDown, ChevronUp, Award } from 'lucide-react';
+import { FlaskConical, ChevronDown, ChevronUp, Award, Zap } from 'lucide-react';
 import { MOCK_EXPERIMENTS } from '../mockData';
+import UncertaintyBar from './UncertaintyBar';
 
 const SCORE_COLOR = score =>
   score >= 0.8 ? 'var(--score-high)' : score >= 0.65 ? 'var(--score-mid)' : 'var(--score-low)';
 
-// Normalize real candidates into the shape ExperimentCard expects
 function normalizeCandidates(candidates) {
   return candidates.map((c, i) => {
-    const additiveParts = (c.composition?.additives ?? []).map(a => ({
-      name: a.name,
-      pct: a.percentage ?? 0,
-    }));
+    const additiveParts = (c.composition?.additives ?? []).map(a => ({ name: a.name, pct: a.percentage ?? 0 }));
     const components = [
-      { name: c.composition?.base_polymer ?? c.material_name ?? 'Base polymer', pct: 100 - additiveParts.reduce((s, a) => s + a.pct, 0) },
+      { name: c.composition?.base_polymer ?? c.material_name ?? 'Base', pct: 100 - additiveParts.reduce((s, a) => s + a.pct, 0) },
       ...additiveParts,
     ];
     return {
@@ -21,14 +18,12 @@ function normalizeCandidates(candidates) {
       label: c.label ?? `Config ${String.fromCharCode(65 + i)}`,
       rank: i + 1,
       composite_score: c.composite_score ?? 0,
-      scores: { strength: c.scores?.strength ?? 0, flexibility: c.scores?.flexibility ?? 0, cost: c.scores?.cost ?? 0.7 },
-      predicted: {
-        tensile_strength: c.predicted?.tensile_strength ?? 0,
-        elongation: c.predicted?.elongation ?? 0,
-        density: c.predicted?.density ?? '—',
-      },
+      scores: c.scores ?? {},
+      surrogate_predictions: c.surrogate_predictions ?? {},
+      acquisition_score: c.acquisition_score ?? 0,
+      acquisition_reason: c.hypothesis ?? '',
       components,
-      process: { temperature: c.processing?.temperature_c ?? '—', cure_time: c.processing?.cure_time_min ?? '—', pressure: '—' },
+      process: { temperature: c.processing?.temperature_c ?? '—', cure_time: c.processing?.cure_time_min ?? '—' },
       hypothesis: c.hypothesis ?? '',
     };
   });
@@ -111,25 +106,47 @@ function ExperimentCard({ exp, isExpanded, onToggle, onSelect }) {
         </div>
       </div>
 
-      {/* Sub-scores */}
-      <div className="flex gap-sm">
-        <SubScore label="Strength"    value={exp.scores?.strength    ?? 0} color="var(--score-high)" />
-        <SubScore label="Flexibility" value={exp.scores?.flexibility ?? 0} color="#6eb4e6" />
-        <SubScore label="Cost"        value={exp.scores?.cost        ?? 0} color="var(--score-mid)" />
-      </div>
+      {/* Sub-scores: dynamic from schema or legacy */}
+      {Object.keys(exp.scores).length > 0 && (
+        <div className="flex gap-sm" style={{ flexWrap: 'wrap' }}>
+          {Object.entries(exp.scores).map(([k, v]) => (
+            <SubScore key={k} label={k.replace(/_/g,' ')} value={v} color="var(--score-high)" />
+          ))}
+        </div>
+      )}
+
+      {/* Acquisition score chip (BO mode) */}
+      {exp.acquisition_score > 0 && (
+        <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+          <Zap size={11} style={{ color: '#a78bfa' }} />
+          <span style={{ fontSize: 10, color: '#a78bfa' }}>
+            EI score: {exp.acquisition_score.toFixed(3)}
+          </span>
+        </div>
+      )}
 
       {/* Expanded content */}
       {isExpanded && (
         <div style={{ marginTop: 12, borderTop: '1px solid var(--glass-border)', paddingTop: 12 }}>
-          {/* Predicted properties */}
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: 6 }}>
-            Predicted Properties
-          </div>
-          <div className="flex gap-sm" style={{ marginBottom: 12, flexWrap: 'wrap' }}>
-            <PropChip label="Tensile" value={`${exp.predicted.tensile_strength} MPa`} highlight={exp.predicted.tensile_strength >= 45} />
-            <PropChip label="Elongation" value={`${exp.predicted.elongation}%`} highlight={exp.predicted.elongation >= 180} />
-            <PropChip label="Density" value={`${exp.predicted.density} g/cm³`} />
-          </div>
+          {/* Surrogate predictions (GP μ ± σ) */}
+          {Object.keys(exp.surrogate_predictions).length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: 6 }}>
+                Surrogate Predictions (GP)
+              </div>
+              {Object.entries(exp.surrogate_predictions).map(([name, pred]) => (
+                <div key={name} style={{ marginBottom: 6 }}>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', marginBottom: 2 }}>{name.replace(/_/g,' ')}</div>
+                  <UncertaintyBar
+                    mean={pred?.mean ?? pred}
+                    std={pred?.std ?? 0}
+                    unit={pred?.unit ?? ''}
+                    trained={pred?.trained !== false}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Formulation */}
           <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.7px', marginBottom: 6 }}>

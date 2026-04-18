@@ -63,7 +63,7 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_gpu": 99,   # offload all layers to GPU (3b fits in 4GB VRAM)
-                "num_ctx": 8192, # enough for 6000-char chunk + system prompt + thorough JSON response
+                "num_ctx": 8192, # 4000-char chunk (~1000 tok) + system prompt (~450 tok) + JSON response — well within limit
             },
             "keep_alive": "15m",
         }

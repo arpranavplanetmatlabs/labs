@@ -74,11 +74,10 @@ async def health_check():
 @app.get("/api/stats")
 async def get_stats():
     store = get_store()
-    all_docs = store.get_all_documents(limit=2000)
-
-    total_docs = len(all_docs)
-    tds_count = sum(1 for d in all_docs if d.get("payload", {}).get("doc_type") == "tds")
-    papers_count = sum(1 for d in all_docs if d.get("payload", {}).get("doc_type") == "paper")
+    # Use server-side count() — no payload transfer, fast Qdrant RPCs
+    total_docs = store.count_documents()
+    tds_count = store.count_documents_by_type("tds")
+    papers_count = store.count_documents_by_type("paper")
     experiments_count = store.count_experiments()
     chunks_count = store.count_chunks()
 
@@ -164,6 +163,13 @@ async def cancel_job(job_id: str):
             status_code=400, detail="Cannot cancel job (may already be completed)"
         )
     return {"success": True, "message": "Job cancelled"}
+
+
+@app.post("/api/jobs/cancel-all")
+async def cancel_all_jobs():
+    job_queue = get_job_queue()
+    count = job_queue.cancel_all_jobs()
+    return {"success": True, "cancelled": count, "message": f"Cancelled {count} job(s)"}
 
 
 @app.get("/api/documents")
@@ -648,7 +654,11 @@ async def add_experiment_results(exp_id: str, result_input: ExperimentResultInpu
 
 @app.delete("/api/experiments/{exp_id}")
 async def delete_experiment(exp_id: str):
-    return {"success": True, "message": "Experiment deleted"}
+    store = get_store()
+    ok = store.delete_experiment(exp_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to delete experiment")
+    return {"success": True, "deleted_id": exp_id}
 
 
 @app.get("/api/experiments/suggest")
@@ -712,27 +722,90 @@ class ChatRequest(BaseModel):
     role: str = "material-expert"
     session_id: str = "default"
     include_context: bool = True
+    compliance_standard: str = ""  # e.g. "ISO-Mechanical", "IEC-EMI", "Nanocomposite-Reporting"
+    force_web_search: bool = False
 
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
+    import asyncio
+    from functools import partial
     from chat import generate_response
 
-    response, sources = generate_response(
+    # Run the synchronous generate_response in a thread pool so FastAPI's
+    # event loop stays free to serve stats/loop polling while LLM is thinking.
+    fn = partial(
+        generate_response,
         query=request.message,
         role=request.role,
         session_id=request.session_id,
         include_context=request.include_context,
+        compliance_standard=request.compliance_standard,
+        force_web_search=request.force_web_search,
     )
+    loop = asyncio.get_event_loop()
+    response, sources, web_used = await loop.run_in_executor(None, fn)
+    return {"response": response, "sources": sources, "session_id": request.session_id, "web_used": web_used}
 
-    return {"response": response, "sources": sources, "session_id": request.session_id}
+
+@app.get("/api/compliance")
+async def list_compliance_standards():
+    from compliance_personas import get_all_auditors
+    return {"standards": get_all_auditors()}
+
+
+class CompliancePersonaCreate(BaseModel):
+    key: str
+    display: str
+    system_prompt: str
+    constraint_summary: str = ""
+
+
+@app.post("/api/compliance")
+async def create_compliance_standard(body: CompliancePersonaCreate):
+    from compliance_personas import add_custom_persona
+    try:
+        persona = add_custom_persona(
+            key=body.key,
+            display=body.display,
+            system_prompt=body.system_prompt,
+            constraint_summary=body.constraint_summary,
+        )
+        return persona
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/api/compliance/{key}")
+async def delete_compliance_standard(key: str):
+    from compliance_personas import delete_custom_persona
+    success = delete_custom_persona(key)
+    if not success:
+        raise HTTPException(status_code=400, detail="Cannot delete built-in standard or key not found")
+    return {"success": True, "deleted": key}
 
 
 @app.get("/api/chat/sessions")
 async def list_chat_sessions():
-    from chat import get_all_sessions
-
-    return {"sessions": get_all_sessions()}
+    # Pull from Qdrant so sessions survive backend restarts
+    from qdrant_store import get_store
+    store = get_store()
+    raw = store.get_all_chat_sessions(limit=100)
+    sessions = [
+        {
+            "session_id": s.get("session_id", ""),
+            "message_count": s.get("message_count", len(s.get("messages", []))),
+            "created_at": s.get("created_at", ""),
+            "last_active": s.get("last_active", ""),
+            "last_message": s["messages"][-1]["content"][:120]
+                if s.get("messages") else None,
+            "first_message": s["messages"][0]["content"][:80]
+                if s.get("messages") else None,
+        }
+        for s in raw
+        if s.get("session_id")
+    ]
+    return {"sessions": sessions}
 
 
 @app.get("/api/chat/sessions/{session_id}/history")
@@ -832,6 +905,7 @@ async def _in_thread(fn, *args, **kwargs):
 class LoopStartRequest(BaseModel):
     goal: str
     weights: Dict[str, float] = {"strength": 0.5, "flexibility": 0.35, "cost": 0.15}
+    schema_id: Optional[str] = None  # Phase 7: BO schema
 
 
 class HypothesisEditRequest(BaseModel):
@@ -848,7 +922,7 @@ async def get_loop_status():
 async def start_loop(req: LoopStartRequest):
     """Start the autonomous loop (runs iteration 1 synchronously, returns when done)."""
     orch = get_orchestrator()
-    result = await _in_thread(orch.start_loop, req.goal, req.weights)
+    result = await _in_thread(orch.start_loop, req.goal, req.weights, req.schema_id)
     return result
 
 
@@ -919,5 +993,204 @@ async def list_graph_materials():
     return {"materials": kg.get_all_materials()}
 
 
+# ── Settings API (6G) ──────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+async def get_settings():
+    from settings_store import get_all
+    settings = get_all()
+    # Mask the API key — return only whether it's set, not the value
+    masked = dict(settings)
+    if masked.get("tavily_api_key"):
+        key = masked["tavily_api_key"]
+        masked["tavily_api_key_set"] = True
+        masked["tavily_api_key_preview"] = key[:4] + "..." + key[-4:] if len(key) > 8 else "****"
+    else:
+        masked["tavily_api_key_set"] = False
+        masked["tavily_api_key_preview"] = ""
+    # Don't send raw key to frontend
+    masked.pop("tavily_api_key", None)
+    return masked
+
+
+class SettingsUpdate(BaseModel):
+    tavily_api_key: Optional[str] = None
+    web_search_enabled: Optional[bool] = None
+
+
+@app.post("/api/settings")
+async def update_settings(body: SettingsUpdate):
+    from settings_store import update, get_all
+    updates = {}
+    if body.tavily_api_key is not None:
+        updates["tavily_api_key"] = body.tavily_api_key
+    if body.web_search_enabled is not None:
+        updates["web_search_enabled"] = body.web_search_enabled
+    if not updates:
+        return {"success": False, "message": "No fields to update"}
+    update(updates)
+    # Return same masked view
+    settings = get_all()
+    masked = dict(settings)
+    if masked.get("tavily_api_key"):
+        key = masked["tavily_api_key"]
+        masked["tavily_api_key_set"] = True
+        masked["tavily_api_key_preview"] = key[:4] + "..." + key[-4:] if len(key) > 8 else "****"
+    else:
+        masked["tavily_api_key_set"] = False
+        masked["tavily_api_key_preview"] = ""
+    masked.pop("tavily_api_key", None)
+    return {"success": True, "settings": masked}
+
+
+# ── Surrogate API (Phase 7) ───────────────────────────────────────────────────
+
+@app.get("/api/experiments/{exp_id}/surrogate")
+async def get_experiment_surrogate(exp_id: str):
+    """Return current GP surrogate predictions + uncertainty for a stored experiment."""
+    from qdrant_store import get_store
+    import json as _json
+    store = get_store()
+    exps = store.get_recent_experiments(limit=200)
+    exp = next((e for e in exps if e.get("exp_id") == exp_id), None)
+    if exp is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Experiment '{exp_id}' not found")
+
+    schema_id = exp.get("schema_id")
+    if not schema_id:
+        return {"exp_id": exp_id, "schema_id": None, "predictions": {}, "note": "No schema attached to this experiment"}
+
+    best = _json.loads(exp["best_candidate"]) if isinstance(exp.get("best_candidate"), str) else exp.get("best_candidate", {})
+    composition = best.get("composition", {})
+
+    from surrogate.registry import get_surrogate_registry
+    schema = store.get_schema(schema_id)
+    if schema is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found")
+
+    registry = get_surrogate_registry()
+    model = await _in_thread(registry.get_or_load, schema_id, schema)
+    predictions = model.predict_single(composition)
+    status = registry.status(schema_id)
+
+    return {
+        "exp_id": exp_id,
+        "schema_id": schema_id,
+        "predictions": predictions,
+        "n_training_points": status["n_training_points"],
+        "is_ready": status["is_ready"],
+        "properties": status["properties"],
+    }
+
+
+@app.post("/api/surrogate/{schema_id}/retrain")
+async def retrain_surrogate(schema_id: str):
+    """Force retrain surrogate from literature + approved experiment history."""
+    from qdrant_store import get_store
+    from surrogate.registry import get_surrogate_registry
+
+    store = get_store()
+    schema = store.get_schema(schema_id)
+    if schema is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found")
+
+    registry = get_surrogate_registry()
+    registry.invalidate(schema_id)
+    model = await _in_thread(registry.get_or_load, schema_id, schema)
+    status = registry.status(schema_id)
+    return {"schema_id": schema_id, "retrained": True, **status}
+
+
+@app.get("/api/surrogate/{schema_id}/status")
+async def surrogate_status(schema_id: str):
+    """Return training status of the surrogate for a schema."""
+    from surrogate.registry import get_surrogate_registry
+    registry = get_surrogate_registry()
+    return registry.status(schema_id)
+
+
+# ── Experiment Schema API (Phase 7) ───────────────────────────────────────────
+
+@app.post("/api/schemas", status_code=201)
+async def create_schema(body: dict):
+    from surrogate.schema import ExperimentSchema, SchemaCreateRequest
+    from qdrant_store import get_store
+    req = SchemaCreateRequest.model_validate(body)
+    schema = ExperimentSchema(
+        name=req.name,
+        material_system=req.material_system,
+        created_by=req.created_by,
+        parameters=req.parameters,
+        properties=req.properties,
+        constraints=req.constraints,
+        notes=req.notes,
+    )
+    store = get_store()
+    schema_id = store.upsert_schema(schema)
+    return {"schema_id": schema_id, "schema": schema.model_dump()}
+
+
+@app.get("/api/schemas")
+async def list_schemas():
+    from qdrant_store import get_store
+    store = get_store()
+    return {"schemas": store.list_schemas()}
+
+
+@app.get("/api/schemas/{schema_id}")
+async def get_schema(schema_id: str):
+    from qdrant_store import get_store
+    store = get_store()
+    schema = store.get_schema(schema_id)
+    if schema is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found")
+    return schema.model_dump()
+
+
+@app.put("/api/schemas/{schema_id}")
+async def update_schema(schema_id: str, body: dict):
+    from surrogate.schema import ExperimentSchema, SchemaUpdateRequest
+    from qdrant_store import get_store
+    from datetime import datetime
+    store = get_store()
+    existing = store.get_schema(schema_id)
+    if existing is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found")
+    req = SchemaUpdateRequest.model_validate(body)
+    updated_data = existing.model_dump()
+    if req.name is not None:
+        updated_data["name"] = req.name
+    if req.material_system is not None:
+        updated_data["material_system"] = req.material_system
+    if req.parameters is not None:
+        updated_data["parameters"] = [p.model_dump() for p in req.parameters]
+    if req.properties is not None:
+        updated_data["properties"] = [p.model_dump() for p in req.properties]
+    if req.constraints is not None:
+        updated_data["constraints"] = req.constraints
+    if req.notes is not None:
+        updated_data["notes"] = req.notes
+    updated_data["updated_at"] = datetime.now().isoformat()
+    updated_schema = ExperimentSchema.model_validate(updated_data)
+    store.upsert_schema(updated_schema)
+    return {"schema_id": schema_id, "schema": updated_schema.model_dump()}
+
+
+@app.delete("/api/schemas/{schema_id}")
+async def delete_schema(schema_id: str):
+    from qdrant_store import get_store
+    store = get_store()
+    success = store.delete_schema(schema_id)
+    if not success:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"Schema '{schema_id}' not found")
+    return {"deleted": schema_id}
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
+    uvicorn.run("main:app", host="0.0.0.0", port=API_PORT, reload=True)

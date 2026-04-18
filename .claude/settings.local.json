@@ -40,7 +40,14 @@
       "Bash(read pid:*)",
       "Bash(CUDA_VISIBLE_DEVICES=0 OLLAMA_GPU_OVERHEAD=0 C:\\\\Users\\\\ASUS\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe serve:*)",
       "Bash(findstr \":11434\")",
-      "Bash(CUDA_VISIBLE_DEVICES=0 OLLAMA_GPU_OVERHEAD=0 OLLAMA_FLASH_ATTENTION=1 C:\\\\Users\\\\ASUS\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe serve:*)"
+      "Bash(CUDA_VISIBLE_DEVICES=0 OLLAMA_GPU_OVERHEAD=0 OLLAMA_FLASH_ATTENTION=1 C:\\\\Users\\\\ASUS\\\\AppData\\\\Local\\\\Programs\\\\Ollama\\\\ollama.exe serve:*)",
+      "WebSearch",
+      "Bash(wc -l /e/rlresearchassistant/backend/*.py /e/rlresearchassistant/src/components/*.jsx)",
+      "Bash(pip show:*)",
+      "Bash(tasklist /fi \"imagename eq python.exe\")",
+      "Bash(xargs cat:*)",
+      "Bash(node -e \"const l = require\\('./node_modules/lucide-react'\\); console.log\\('Activity:', !!l.Activity, 'Database:', !!l.Database, 'Zap:', !!l.Zap\\)\")",
+      "Bash(node -e ':*)"
     ]
   }
 }

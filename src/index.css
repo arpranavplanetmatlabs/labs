@@ -485,12 +485,14 @@ body {
   transform: translateY(-1px);
 }
 
-.btn-ghost {
+.btn-ghost,
+.btn-secondary {
   background: transparent;
   color: var(--text-secondary);
   border: 1px solid var(--glass-border);
 }
-.btn-ghost:hover {
+.btn-ghost:hover,
+.btn-secondary:hover {
   background: var(--glass-hover);
   color: var(--text-primary);
   border-color: var(--accent-dim);

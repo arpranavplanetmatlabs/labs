@@ -9,6 +9,7 @@ import DecisionPanel from './components/DecisionPanel';
 import PapersView from './components/PapersView';
 import ExperimentsPanel from './components/ExperimentsPanel';
 import ChatPanel from './components/ChatPanel';
+import SettingsPanel from './components/SettingsPanel';
 
 const API_BASE = 'http://localhost:8000';
 
@@ -27,6 +28,7 @@ export default function App() {
     });
   }, []);
   const [counts, setCounts] = useState({ documents: 0, tds: 0, papers: 0, experiments: 0, qdrant_parsed: 0 });
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [loopState, setLoopState] = useState(null);   // null = not yet fetched
   const [loopLoading, setLoopLoading] = useState(false);
   const loopLoadingRef = useRef(false);
@@ -36,8 +38,8 @@ export default function App() {
   useEffect(() => {
     fetchStats();
     fetchLoopStatus();
-    const statsInterval = setInterval(fetchStats, 5000);
-    const loopInterval = setInterval(fetchLoopStatus, 3000);
+    const statsInterval = setInterval(fetchStats, 30000);
+    const loopInterval = setInterval(fetchLoopStatus, 10000);
     return () => {
       clearInterval(statsInterval);
       clearInterval(loopInterval);
@@ -72,7 +74,7 @@ export default function App() {
 
   // ── Loop handlers ──────────────────────────────────────────────────────────
 
-  const handleToggleLoop = useCallback(async ({ active, goal, weights }) => {
+  const handleToggleLoop = useCallback(async ({ active, goal, weights, schema_id }) => {
     if (!active) {
       await handleStopLoop();
       return;
@@ -83,7 +85,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/loop/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal, weights }),
+        body: JSON.stringify({ goal, weights, schema_id: schema_id || null }),
       });
       if (res.ok) setLoopState(await res.json());
     } catch (e) {
@@ -94,10 +96,9 @@ export default function App() {
     }
   }, []);
 
-  const handleRunIteration = useCallback(async ({ goal, weights }) => {
+  const handleRunIteration = useCallback(async ({ goal, weights, schema_id }) => {
     setLoopLoading(true);
     loopLoadingRef.current = true;
-    // If loop hasn't started yet, use start; otherwise iterate
     const endpoint = (!loopState || loopState.status === 'idle' || loopState.status === 'stopped')
       ? `${API_BASE}/api/loop/start`
       : `${API_BASE}/api/loop/iterate`;
@@ -105,7 +106,7 @@ export default function App() {
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal, weights }),
+        body: JSON.stringify({ goal, weights, schema_id: schema_id || null }),
       });
       if (res.ok) setLoopState(await res.json());
     } catch (e) {
@@ -171,7 +172,9 @@ export default function App() {
         counts={counts}
         collapsed={sidebarCollapsed}
         onToggleCollapse={handleToggleCollapse}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
+      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
 
       <div className="main-content">
         <div className="topbar">
@@ -260,15 +263,9 @@ function ResearchView({ loopState, loopLoading, onSelectExp, selectedExp, onTogg
 }
 
 function ExperimentsView() {
-  const [showCreateModal, setShowCreateModal] = useState(false);
   return (
-    <div style={{ display: 'flex', gap: 'var(--pad-md)', height: '100%', overflow: 'hidden' }}>
-      <div style={{ flex: '0 0 380px', overflow: 'hidden' }}>
-        <ExperimentsPanel onCreateNew={() => setShowCreateModal(true)} />
-      </div>
-      <div style={{ flex: 1, overflow: 'hidden' }}>
-        <ResultsPanel />
-      </div>
+    <div style={{ height: '100%', overflow: 'hidden' }}>
+      <ExperimentsPanel />
     </div>
   );
 }
