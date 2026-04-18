@@ -141,7 +141,8 @@ class JobQueue:
         self.active_jobs: Dict[str, Job] = {}
         self.job_counter = 0
 
-        self._qdrant_client = QdrantClient(url=QDRANT_URL)
+        from config import get_qdrant_client
+        self._qdrant_client = get_qdrant_client()
         self._ensure_job_collection()
 
         self.worker_task: Optional[asyncio.Task] = None
@@ -258,12 +259,13 @@ class JobQueue:
 
     def _save_job(self, job: Job) -> None:
         try:
+            from qdrant_client.models import PointStruct
             payload = job.to_dict()
             payload["status"] = job.status.value if isinstance(job.status, Enum) else job.status
             payload["priority"] = job.priority.value if isinstance(job.priority, Enum) else job.priority
             self._qdrant_client.upsert(
                 collection_name="job_status",
-                points=[{"id": job.job_id, "vector": [0], "payload": payload}],
+                points=[PointStruct(id=job.job_id, vector=[0.0], payload=payload)],
             )
         except Exception as e:
             logger.error(f"Error saving job: {e}")
@@ -280,6 +282,47 @@ class JobQueue:
         job.completed_at = datetime.now().isoformat()
         self.update_job(job)
         return True
+
+    def cancel_all_jobs(self) -> int:
+        """Cancel all queued/pending/running jobs. Returns count cancelled."""
+        cancelled = 0
+        # Drain the in-memory priority queues
+        for queue in (self.high_priority, self.medium_priority, self.low_priority):
+            while queue:
+                _, job = heapq.heappop(queue)
+                job.status = JobStatus.CANCELLED
+                job.completed_at = datetime.now().isoformat()
+                self._save_job(job)
+                cancelled += 1
+        # Also mark any active jobs (currently running) as cancelled
+        # so the worker skips storing results after the current LLM call finishes
+        for job in list(self.active_jobs.values()):
+            if job.status in [JobStatus.RUNNING, JobStatus.QUEUED, JobStatus.PENDING]:
+                job.status = JobStatus.CANCELLED
+                job.completed_at = datetime.now().isoformat()
+                self._save_job(job)
+                cancelled += 1
+        # Persist cancellation of any queued jobs still only in Qdrant
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchAny
+            results, _ = self._qdrant_client.scroll(
+                collection_name="job_status",
+                scroll_filter=Filter(must=[FieldCondition(
+                    key="status", match=MatchAny(any=["queued", "pending", "running"]),
+                )]),
+                limit=200, with_vectors=False,
+            )
+            for point in results:
+                job = self._job_from_payload(point.payload)
+                if job and job.status not in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                    job.status = JobStatus.CANCELLED
+                    job.completed_at = datetime.now().isoformat()
+                    self._save_job(job)
+                    cancelled += 1
+        except Exception as e:
+            logger.warning(f"cancel_all Qdrant scan failed: {e}")
+        print(f"[QUEUE] Cancelled {cancelled} job(s)")
+        return cancelled
 
     async def process_job(self, job: Job) -> Job:
         job.status = JobStatus.RUNNING
@@ -386,6 +429,12 @@ class JobQueue:
             except Exception as kg_e:
                 logger.warning(f"KG edge extraction failed (non-fatal): {kg_e}")
 
+            # Check if cancelled while we were processing
+            fresh = self.get_job(job.job_id)
+            if fresh and fresh.status == JobStatus.CANCELLED:
+                print(f"[WORKER] {job.filename} was cancelled — discarding results")
+                return job
+
             job.status = JobStatus.COMPLETED
             job.progress = 100.0
             job.current_step = "Completed"
@@ -474,7 +523,8 @@ class JobQueue:
 
     def start_worker(self):
         if self.worker_task is None or self.worker_task.done():
-            self.recover_queued_jobs()
+            # Disabled auto-recovery to prevent re-processing old files
+            # self.recover_queued_jobs()
             self.worker_task = asyncio.create_task(self.worker_loop())
 
     def stop_worker(self):

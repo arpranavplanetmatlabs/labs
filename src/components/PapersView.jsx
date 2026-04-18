@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { FileText, Upload, CheckCircle, AlertCircle, Loader, Clock, FolderOpen, Search, Database, Cpu, Trash2 } from 'lucide-react';
+import { FileText, Upload, CheckCircle, AlertCircle, Loader, Clock, FolderOpen, Search, Database, Cpu, Trash2, XCircle } from 'lucide-react';
 import DocumentDetails from './DocumentDetails';
 
 const API_BASE = 'http://localhost:8000';
@@ -41,7 +41,7 @@ export default function PapersView() {
       fetchDocuments();
       fetchStats();
       fetchJobs();
-    }, 3000);
+    }, 15000);
     
     return () => {
       clearInterval(interval);
@@ -229,6 +229,19 @@ export default function PapersView() {
     if (showParsed) fetchParsedDocs();
   }, [showParsed]);
 
+  const handleTerminateAll = async () => {
+    if (!confirm(`Terminate all ${queuedJobs.length} queued/running job(s)?`)) return;
+    try {
+      await fetch(`${API_BASE}/api/jobs/cancel-all`, { method: 'POST' });
+      setQueuedJobs([]);
+      setBulkProcessing(false);
+      setBulkProgress(null);
+      await fetchJobs();
+    } catch (err) {
+      console.error('Terminate all failed:', err);
+    }
+  };
+
   const handleBulkDelete = async () => {
     if (selectedIds.size === 0) return;
     if (!confirm(`Delete ${selectedIds.size} document(s)? This cannot be undone.`)) return;
@@ -374,7 +387,7 @@ export default function PapersView() {
         )}
 
         {queuedJobs.length > 0 && (
-          <CyberExtractionBanner jobs={queuedJobs} />
+          <CyberExtractionBanner jobs={queuedJobs} onTerminate={handleTerminateAll} />
         )}
 
         {searchResults && (
@@ -688,7 +701,13 @@ const TICKER_TOKENS = [
   { text: '▸', cls: 'mid' },
   { text: 'IDENTIFYING MATERIAL NAME', cls: 'mid' },
   { text: '▸', cls: 'mid' },
-  { text: 'EXTRACTING TENSILE DATA', cls: 'mid' },
+  { text: 'EXTRACTING MECHANICAL PROPERTIES', cls: 'mid' },
+  { text: '▸', cls: 'mid' },
+  { text: 'EXTRACTING EMI SHIELDING DATA', cls: 'mid' },
+  { text: '▸', cls: 'mid' },
+  { text: 'EXTRACTING THERMAL PROPERTIES', cls: 'mid' },
+  { text: '▸', cls: 'mid' },
+  { text: 'EXTRACTING FILLER LOADING', cls: 'mid' },
   { text: '▸', cls: 'mid' },
   { text: 'VECTORISING CHUNKS', cls: 'hi' },
   { text: '▸', cls: 'mid' },
@@ -713,7 +732,7 @@ const STEP_LABELS = {
   'pending':              'INITIALISING',
 };
 
-function CyberExtractionBanner({ jobs }) {
+function CyberExtractionBanner({ jobs, onTerminate }) {
   const running = jobs.find(j => j.status === 'running');
   const activeJob = running || jobs[0];
   const queuedCount = jobs.filter(j => j.status === 'queued').length;
@@ -753,6 +772,25 @@ function CyberExtractionBanner({ jobs }) {
               {jobs.length} JOB{jobs.length !== 1 ? 'S' : ''}
               {queuedCount > 0 && ` · ${queuedCount} QUEUED`}
             </span>
+            <button
+              onClick={onTerminate}
+              title="Terminate all queued and running jobs"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 4,
+                background: 'rgba(180,60,60,0.15)',
+                border: '1px solid rgba(180,60,60,0.35)',
+                borderRadius: 4,
+                color: '#e07070',
+                fontSize: 10,
+                fontFamily: 'var(--font-mono)',
+                letterSpacing: '0.06em',
+                padding: '3px 8px',
+                cursor: 'pointer',
+                flexShrink: 0,
+              }}
+            >
+              <XCircle size={10} /> TERMINATE
+            </button>
           </div>
           {/* Active filename */}
           <div style={{

@@ -1,5 +1,5 @@
 import { useRef, useCallback } from 'react';
-import { Microscope, FileText, FlaskConical, BarChart3, Brain, MessageSquare, Cpu, Database, Zap, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Microscope, FileText, FlaskConical, BarChart3, Brain, MessageSquare, Cpu, Database, Zap, ChevronLeft, ChevronRight, Settings } from 'lucide-react';
 
 const NAV_ITEMS = [
   { id: 'research',     label: 'Research',     icon: Microscope },
@@ -10,7 +10,7 @@ const NAV_ITEMS = [
   { id: 'chat',         label: 'Chat',         icon: MessageSquare },
 ];
 
-export default function Sidebar({ active, onNav, counts = {}, collapsed = false, onToggleCollapse }) {
+export default function Sidebar({ active, onNav, counts = {}, collapsed = false, onToggleCollapse, onOpenSettings }) {
   const navRefs = useRef({});
 
   const handleKeyDown = useCallback((e, id, index) => {
@@ -92,6 +92,24 @@ export default function Sidebar({ active, onNav, counts = {}, collapsed = false,
           <StatusRow icon={<Database size={12} />} label="Qdrant" state="online" detail={`${counts.qdrant_parsed || 0} pts`} collapsed={collapsed} />
           <StatusRow icon={<Zap size={12} />} label="Engine" state="online" detail={`${counts.experiments || 0} exps`} collapsed={collapsed} />
         </div>
+
+        {/* Settings gear icon */}
+        <button
+          onClick={onOpenSettings}
+          title="Settings"
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: collapsed ? 'center' : 'flex-start',
+            gap: 8, width: '100%', marginTop: 8,
+            background: 'transparent', border: 'none', cursor: 'pointer',
+            color: 'var(--text-muted)', padding: collapsed ? '6px 0' : '6px 4px',
+            borderRadius: 'var(--r-sm)', transition: 'color 0.15s',
+          }}
+          onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
+          onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}
+        >
+          <Settings size={14} />
+          {!collapsed && <span style={{ fontSize: 12 }}>Settings</span>}
+        </button>
       </div>
     </aside>
   );

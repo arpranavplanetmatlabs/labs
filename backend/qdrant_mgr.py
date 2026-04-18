@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 class QdrantManager:
     def __init__(self):
-        self.client = QdrantClient(url=QDRANT_URL)
+        from config import get_qdrant_client
+        self.client = get_qdrant_client()
 
     # ── Primary search (graph-aware) ──────────────────────────────────────────
 

@@ -41,6 +41,7 @@ from config import (
     COLL_EDGES,
     COLL_FOLDERS,
     COLL_CHAT_SESSIONS,
+    COLL_SCHEMAS,
 )
 
 logger = logging.getLogger(__name__)
@@ -63,7 +64,8 @@ def calculate_file_hash(file_path: str) -> str:
 
 class QdrantStore:
     def __init__(self):
-        self.client = QdrantClient(url=QDRANT_URL)
+        from config import get_qdrant_client
+        self.client = get_qdrant_client()
         self.embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE)
         self._ensure_collections()
 
@@ -105,6 +107,14 @@ class QdrantStore:
                     ),  # Dummy vector for compatibility
                 )
                 logger.info(f"Created collection: {COLL_CHAT_SESSIONS}")
+
+            # Experiment schemas collection (Phase 7)
+            if COLL_SCHEMAS not in existing:
+                self.client.create_collection(
+                    collection_name=COLL_SCHEMAS,
+                    vectors_config=VectorParams(size=1, distance=Distance.COSINE),
+                )
+                logger.info(f"Created collection: {COLL_SCHEMAS}")
 
             self._create_payload_indexes()
         except Exception as e:
@@ -237,6 +247,18 @@ class QdrantStore:
     def count_documents(self) -> int:
         try:
             return self.client.count(collection_name=COLL_DOCUMENTS).count
+        except Exception:
+            return 0
+
+    def count_documents_by_type(self, doc_type: str) -> int:
+        """Count documents matching a doc_type payload field — no payload transfer."""
+        try:
+            return self.client.count(
+                collection_name=COLL_DOCUMENTS,
+                count_filter=Filter(
+                    must=[FieldCondition(key="doc_type", match=MatchValue(value=doc_type))]
+                ),
+            ).count
         except Exception:
             return 0
 
@@ -390,7 +412,9 @@ class QdrantStore:
             if key_findings is not None:
                 payload_update["key_findings"] = json.dumps(key_findings)
             if processing_conditions is not None:
-                payload_update["processing_conditions"] = json.dumps(processing_conditions)
+                payload_update["processing_conditions"] = json.dumps(
+                    processing_conditions
+                )
             self.client.set_payload(
                 collection_name=COLL_DOCUMENTS,
                 payload=payload_update,
@@ -460,6 +484,9 @@ class QdrantStore:
         best_candidate: Dict,
         reasoning: str,
         composite_score: float,
+        schema_id: str = None,
+        surrogate_predictions: Any = None,
+        acquisition_score: float = 0.0,
     ) -> str:
         text = f"{name}: {goal[:200]} — {reasoning[:200]}"
         vector = self._embed_query(text)
@@ -473,6 +500,9 @@ class QdrantStore:
             "best_candidate": json.dumps(best_candidate),
             "reasoning": reasoning,
             "composite_score": composite_score,
+            "schema_id": schema_id or "",
+            "surrogate_predictions": json.dumps(surrogate_predictions) if surrogate_predictions else "",
+            "acquisition_score": acquisition_score,
             "status": "completed",
             "created_at": datetime.now().isoformat(),
         }
@@ -501,6 +531,17 @@ class QdrantStore:
             return self.client.count(collection_name=COLL_EXPERIMENTS).count
         except Exception:
             return 0
+
+    def delete_experiment(self, exp_id: str) -> bool:
+        try:
+            self.client.delete(
+                collection_name=COLL_EXPERIMENTS,
+                points_selector=[exp_id],
+            )
+            return True
+        except Exception as e:
+            logger.error(f"delete_experiment error: {e}")
+            return False
 
     # ── Folders (crawler registry) ────────────────────────────────────────────
 
@@ -658,179 +699,99 @@ class QdrantStore:
     def delete_chat_session(self, session_id: str) -> bool:
         """Delete a chat session."""
         try:
+            # Use filter instead of points_selector list - more reliable
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
             self.client.delete(
                 collection_name=COLL_CHAT_SESSIONS,
-                points_selector=[session_id],
+                points_selector=Filter(
+                    must=[FieldCondition(key="session_id", match=MatchValue(value=session_id))]
+                ),
             )
             return True
         except Exception as e:
             logger.error(f"delete_chat_session error: {e}")
             return False
 
-    # ── Experiments (persistent storage) ─────────────────────────────────────
+    # ── Experiment Schemas (Phase 7) ──────────────────────────────────────────
 
-    def upsert_experiment(
-        self,
-        experiment_id: int,
-        name: str,
-        material_name: str,
-        description: str,
-        conditions: Dict[str, Any],
-        expected_output: Dict[str, Any],
-        actual_output: Dict[str, Any],
-        results: List[Dict[str, Any]],
-        status: str,
-        confidence_score: float,
-        predictions: Dict[str, Any],
-        suggestions: List[Dict[str, Any]],
-    ) -> bool:
-        """Save or update an experiment."""
-        try:
-            # Generate content for embedding
-            content = f"{name} {material_name} {description} {json.dumps(conditions)} {json.dumps(expected_output)}"
+    def upsert_schema(self, schema) -> str:
+        """
+        Persist an ExperimentSchema to Qdrant.
+        schema can be an ExperimentSchema instance or a dict.
+        Returns schema_id.
+        """
+        from surrogate.schema import ExperimentSchema
+        if isinstance(schema, dict):
+            schema = ExperimentSchema.model_validate(schema)
 
-            # Generate embedding for search
-            vector = self.embeddings.embed_query(content[:500])
+        schema_uuid = str(uuid.uuid5(uuid.NAMESPACE_URL, schema.schema_id))
+        payload = schema.to_payload()
+        self.client.upsert(
+            collection_name=COLL_SCHEMAS,
+            points=[PointStruct(id=schema_uuid, vector=[0.0], payload=payload)],
+        )
+        logger.info(f"[Schema] Upserted schema '{schema.name}' ({schema.schema_id})")
+        return schema.schema_id
 
-            payload = {
-                "experiment_id": experiment_id,
-                "name": name,
-                "material_name": material_name,
-                "description": description,
-                "conditions": json.dumps(conditions),
-                "expected_output": json.dumps(expected_output),
-                "actual_output": json.dumps(actual_output),
-                "results": json.dumps(results),
-                "status": status,
-                "confidence_score": confidence_score,
-                "predictions": json.dumps(predictions) if predictions else None,
-                "suggestions": json.dumps(suggestions) if suggestions else None,
-                "created_at": datetime.now().isoformat(),
-                "updated_at": datetime.now().isoformat(),
-            }
-            self.client.upsert(
-                collection_name=COLL_EXPERIMENTS,
-                points=[PointStruct(id=experiment_id, vector=vector, payload=payload)],
-            )
-            return True
-        except Exception as e:
-            logger.error(f"upsert_experiment error: {e}")
-            return False
-
-    def get_experiment(self, experiment_id: int) -> Optional[Dict[str, Any]]:
-        """Retrieve an experiment by ID."""
+    def get_schema(self, schema_id: str):
+        """Retrieve a single ExperimentSchema by schema_id. Returns None if not found."""
+        from surrogate.schema import ExperimentSchema
         try:
             results, _ = self.client.scroll(
-                collection_name=COLL_EXPERIMENTS,
-                limit=1,
-                filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="experiment_id", match=MatchValue(value=experiment_id)
-                        )
-                    ]
+                collection_name=COLL_SCHEMAS,
+                scroll_filter=Filter(
+                    must=[FieldCondition(key="schema_id", match=MatchValue(value=schema_id))]
                 ),
+                limit=1,
                 with_vectors=False,
             )
-            if results:
-                payload = results[0].payload
-                # Parse JSON fields
-                for field in [
-                    "conditions",
-                    "expected_output",
-                    "actual_output",
-                    "results",
-                    "predictions",
-                    "suggestions",
-                ]:
-                    if payload.get(field):
-                        try:
-                            payload[field] = json.loads(payload[field])
-                        except:
-                            pass
-                return payload
-            return None
+            if not results:
+                return None
+            return ExperimentSchema.from_payload(results[0].payload)
         except Exception as e:
-            logger.error(f"get_experiment error: {e}")
+            logger.error(f"get_schema error: {e}")
             return None
 
-    def get_all_experiments(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Get all experiments."""
+    def list_schemas(self) -> List[Dict[str, Any]]:
+        """Return all schemas as lightweight summary dicts (no full JSON blob)."""
         try:
             results, _ = self.client.scroll(
-                collection_name=COLL_EXPERIMENTS,
-                limit=limit,
+                collection_name=COLL_SCHEMAS,
+                limit=500,
                 with_vectors=False,
             )
-            experiments = []
+            summaries = []
             for p in results:
-                payload = p.payload
-                # Parse JSON fields
-                for field in [
-                    "conditions",
-                    "expected_output",
-                    "actual_output",
-                    "results",
-                    "predictions",
-                    "suggestions",
-                ]:
-                    if payload.get(field):
-                        try:
-                            payload[field] = json.loads(payload[field])
-                        except:
-                            pass
-                experiments.append(payload)
-            return sorted(
-                experiments, key=lambda x: x.get("created_at", ""), reverse=True
-            )
+                pl = p.payload
+                summaries.append({
+                    "schema_id": pl.get("schema_id"),
+                    "name": pl.get("name"),
+                    "material_system": pl.get("material_system"),
+                    "created_by": pl.get("created_by"),
+                    "created_at": pl.get("created_at"),
+                    "updated_at": pl.get("updated_at"),
+                    "n_parameters": pl.get("n_parameters"),
+                    "n_properties": pl.get("n_properties"),
+                    "property_names": pl.get("property_names", "").split(","),
+                })
+            return sorted(summaries, key=lambda x: x.get("created_at", ""), reverse=True)
         except Exception as e:
-            logger.error(f"get_all_experiments error: {e}")
+            logger.error(f"list_schemas error: {e}")
             return []
 
-    def delete_experiment(self, experiment_id: int) -> bool:
-        """Delete an experiment."""
+    def delete_schema(self, schema_id: str) -> bool:
+        """Delete schema by schema_id. Returns True if deleted."""
         try:
             self.client.delete(
-                collection_name=COLL_EXPERIMENTS,
-                points_selector=[experiment_id],
+                collection_name=COLL_SCHEMAS,
+                points_selector=Filter(
+                    must=[FieldCondition(key="schema_id", match=MatchValue(value=schema_id))]
+                ),
             )
             return True
         except Exception as e:
-            logger.error(f"delete_experiment error: {e}")
+            logger.error(f"delete_schema error: {e}")
             return False
-
-    def search_experiments(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """Semantic search over experiments."""
-        try:
-            vector = self.embeddings.embed_query(query)
-            results = self.client.search(
-                collection_name=COLL_EXPERIMENTS,
-                query_vector=vector,
-                limit=limit,
-            )
-            experiments = []
-            for r in results:
-                payload = r.payload
-                payload["score"] = r.score
-                # Parse JSON fields
-                for field in [
-                    "conditions",
-                    "expected_output",
-                    "actual_output",
-                    "results",
-                    "predictions",
-                    "suggestions",
-                ]:
-                    if payload.get(field):
-                        try:
-                            payload[field] = json.loads(payload[field])
-                        except:
-                            pass
-                experiments.append(payload)
-            return experiments
-        except Exception as e:
-            logger.error(f"search_experiments error: {e}")
-            return []
 
 
 # ── Singleton ─────────────────────────────────────────────────────────────────

@@ -20,7 +20,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional, List
 
 from config import LLM_MODEL
-from qdrant_mgr import get_qdrant_manager
 from experiment_runner import predict_properties, calculate_composite_score
 
 
@@ -31,8 +30,8 @@ class LoopStatus:
     STOPPED = "stopped"
 
 
-# Loop pipeline steps shown in DecisionPanel progress bar
-LOOP_STEP_NAMES = ["Retrieve", "Generate", "Evaluate", "Decide", "Approve"]
+# Phase 7: BO-aware step names
+LOOP_STEP_NAMES = ["Retrieve", "Seed/Acquire", "Predict", "Decide", "Approve"]
 
 
 class LoopOrchestrator:
@@ -41,6 +40,7 @@ class LoopOrchestrator:
         self._state: Dict[str, Any] = {
             "status": LoopStatus.IDLE,
             "goal": "",
+            "schema_id": None,
             "weights": {"strength": 0.5, "flexibility": 0.35, "cost": 0.15},
             "iteration": 0,
             "current_exp_id": None,
@@ -48,9 +48,11 @@ class LoopOrchestrator:
             "best_candidate": None,
             "reasoning": "",
             "next_hypothesis": "",
-            "active_step": 0,   # index into LOOP_STEP_NAMES (0-4)
+            "active_step": 0,
             "error": None,
             "history": [],
+            "bo_mode": False,       # True when schema_id is set and BO is active
+            "n_training_points": 0, # GP training data count
         }
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -62,11 +64,12 @@ class LoopOrchestrator:
                 "step_names": LOOP_STEP_NAMES,
             }
 
-    def start_loop(self, goal: str, weights: Dict[str, float]) -> Dict[str, Any]:
+    def start_loop(self, goal: str, weights: Dict[str, float], schema_id: str = None) -> Dict[str, Any]:
         with self._lock:
             self._state.update({
                 "status": LoopStatus.RUNNING,
                 "goal": goal,
+                "schema_id": schema_id,
                 "weights": weights,
                 "iteration": 0,
                 "candidates": [],
@@ -76,6 +79,8 @@ class LoopOrchestrator:
                 "active_step": 0,
                 "error": None,
                 "history": [],
+                "bo_mode": bool(schema_id),
+                "n_training_points": 0,
             })
         return self._run_iteration_impl()
 
@@ -93,6 +98,25 @@ class LoopOrchestrator:
                 return {"error": f"Cannot approve in state: {self._state['status']}"}
             self._state["status"] = LoopStatus.RUNNING
             self._state["error"] = None
+            schema_id = self._state.get("schema_id")
+            best = self._state.get("best_candidate") or {}
+
+        # Record approved point in surrogate registry → triggers GP retrain
+        if schema_id and best:
+            try:
+                from surrogate.loop import record_approval
+                composition = best.get("composition", {})
+                preds = best.get("surrogate_predictions", {})
+                # Extract mean values as the observation
+                property_values = {
+                    k: v.get("mean", v) if isinstance(v, dict) else v
+                    for k, v in preds.items()
+                }
+                if composition and property_values:
+                    record_approval(schema_id, composition, property_values)
+            except Exception as e:
+                print(f"[Orchestrator] Retrain on approval failed (non-fatal): {e}")
+
         return self._run_iteration_impl()
 
     def stop(self):
@@ -117,29 +141,35 @@ class LoopOrchestrator:
                 goal = self._state["goal"]
                 weights = self._state["weights"]
                 hypothesis = self._state["next_hypothesis"]
+                schema_id = self._state.get("schema_id")
 
-            # ── Step 1: Retrieve ─────────────────────────────────────
+            # ── Step 1: Retrieve ──────────────────────────────────────
             self._set_step(0)
             context_text = self._retrieve_context(goal, hypothesis)
 
-            # ── Step 2: Generate ─────────────────────────────────────
+            # ── Step 2: Generate / Acquire ────────────────────────────
             self._set_step(1)
-            candidates = self._generate_candidates(goal, hypothesis, context_text, iteration)
+            if schema_id:
+                # BO mode: use acquisition function to suggest candidates
+                candidates, bo_meta = self._bo_candidates(schema_id, goal, iteration)
+            else:
+                candidates = self._generate_candidates(goal, hypothesis, context_text, iteration)
+                bo_meta = {}
 
-            # ── Step 3: Evaluate ─────────────────────────────────────
+            # ── Step 3: Predict / Evaluate ────────────────────────────
             self._set_step(2)
-            scored = self._score_candidates(candidates, weights)
+            scored = self._score_candidates(candidates, weights, schema_id=schema_id)
 
-            # ── Step 4: Decide ───────────────────────────────────────
+            # ── Step 4: Decide ────────────────────────────────────────
             self._set_step(3)
             best = scored[0] if scored else {}
             reasoning, next_hyp = self._generate_decision(scored, best, goal, iteration)
 
-            # ── Persist to DuckDB ────────────────────────────────────
-            exp_id = self._persist(goal, scored, best, reasoning, iteration)
+            exp_id = self._persist(goal, scored, best, reasoning, iteration, schema_id)
 
-            # ── Update state → awaiting approval ─────────────────────
+            # ── Step 5: Await approval ────────────────────────────────
             self._set_step(4)
+            n_pts = bo_meta.get("n_training_points", 0)
             history_entry = {
                 "iteration": iteration,
                 "best_label": best.get("label", ""),
@@ -158,6 +188,8 @@ class LoopOrchestrator:
                     "current_exp_id": exp_id,
                     "error": None,
                     "history": self._state["history"] + [history_entry],
+                    "n_training_points": n_pts,
+                    "bo_mode": bool(schema_id),
                 })
 
             return self.get_status()
@@ -172,6 +204,31 @@ class LoopOrchestrator:
             return self.get_status()
 
     # ── Step implementations ──────────────────────────────────────────────────
+
+    def _bo_candidates(self, schema_id: str, goal: str, iteration: int):
+        """Use BO acquisition function to generate candidates."""
+        from surrogate.loop import bo_iteration
+        result = bo_iteration(schema_id=schema_id, goal=goal, iteration=iteration, n_candidates=5)
+        raw_candidates = result.get("candidates", [])
+        # Convert BO candidate format to orchestrator format
+        candidates = []
+        for c in raw_candidates:
+            comp = c.get("composition", {})
+            candidates.append({
+                "label": f"Config {c.get('rank', '?')}",
+                "material_name": schema_id,
+                "composition": comp,
+                "processing": {},
+                "hypothesis": c.get("acquisition_reason", ""),
+                # Carry BO metadata forward
+                "_bo_predictions": c.get("predictions", {}),
+                "_bo_acquisition_score": c.get("acquisition_score", 0),
+                "_bo_rank": c.get("rank", 0),
+            })
+        return candidates, {
+            "n_training_points": result.get("n_training_points", 0),
+            "mode": result.get("mode", "doe"),
+        }
 
     def _retrieve_context(self, goal: str, hypothesis: str) -> str:
         try:
@@ -273,53 +330,61 @@ Return ONLY this JSON:
             },
         ]
 
-    def _score_candidates(self, candidates: List[Dict], weights: Dict) -> List[Dict]:
+    def _score_candidates(self, candidates: List[Dict], weights: Dict, schema_id: str = None) -> List[Dict]:
+        schema = None
+        if schema_id:
+            try:
+                from qdrant_store import get_store
+                schema = get_store().get_schema(schema_id)
+            except Exception:
+                pass
+
         scored = []
         for c in candidates:
             try:
-                prediction = predict_properties(
-                    material_name=c.get("material_name", "Unknown"),
-                    composition=c.get("composition", {}),
-                    conditions=c.get("processing", {}),
-                )
+                # Use BO predictions if already computed (BO mode)
+                bo_preds = c.pop("_bo_predictions", None)
+                acq_score = c.pop("_bo_acquisition_score", 0)
+                c.pop("_bo_rank", None)
 
-                if prediction.get("status") == "success" and prediction.get("predictions"):
-                    preds = prediction["predictions"]
+                if bo_preds:
+                    preds = bo_preds
+                    pred_status = "success"
+                else:
+                    prediction = predict_properties(
+                        composition=c.get("composition", {}),
+                        schema_id=schema_id or "",
+                        material_name=c.get("material_name", ""),
+                    )
+                    pred_status = prediction.get("status")
+                    preds = prediction.get("predictions", {}) if pred_status == "success" else {}
+
+                if preds:
                     score_result = calculate_composite_score(
                         predicted_props=preds,
+                        schema=schema,
                         expected_props={"tensile_strength": 45, "elongation": 150},
                         weights=weights,
                     )
-                    predicted = {
-                        "tensile_strength": preds.get("tensile_strength_mpa", {}).get("value", 0) if isinstance(preds.get("tensile_strength_mpa"), dict) else 0,
-                        "elongation": preds.get("elongation_percent", {}).get("value", 0) if isinstance(preds.get("elongation_percent"), dict) else 0,
-                    }
                     composite = score_result["composite_score"]
                     scores = score_result.get("scores", {})
                 else:
-                    # Heuristic fallback: vary scores realistically
                     base = round(0.55 + random.uniform(-0.1, 0.25), 3)
                     composite = base
-                    scores = {
-                        "strength": round(base + random.uniform(-0.08, 0.08), 3),
-                        "flexibility": round(base + random.uniform(-0.08, 0.08), 3),
-                        "cost": round(0.65 + random.uniform(-0.1, 0.1), 3),
-                    }
-                    predicted = {
-                        "tensile_strength": round(30 + random.uniform(0, 40), 1),
-                        "elongation": round(100 + random.uniform(0, 200), 1),
-                    }
+                    scores = {"strength": base, "flexibility": base, "cost": 0.65}
+                    preds = {}
 
                 scored.append({
                     **c,
-                    "predicted": predicted,
+                    "surrogate_predictions": preds,
                     "composite_score": composite,
                     "scores": scores,
+                    "acquisition_score": acq_score,
                 })
             except Exception as e:
                 scored.append({
                     **c,
-                    "predicted": {"tensile_strength": 0, "elongation": 0},
+                    "surrogate_predictions": {},
                     "composite_score": 0.5,
                     "scores": {},
                     "score_error": str(e),
@@ -394,7 +459,7 @@ Return JSON:
 
         return default_reasoning, default_next_hyp
 
-    def _persist(self, goal: str, candidates: List[Dict], best: Dict, reasoning: str, iteration: int) -> Optional[str]:
+    def _persist(self, goal: str, candidates: List[Dict], best: Dict, reasoning: str, iteration: int, schema_id: str = None) -> Optional[str]:
         try:
             from qdrant_store import get_store
             store = get_store()
@@ -409,6 +474,9 @@ Return JSON:
                 best_candidate=best,
                 reasoning=reasoning,
                 composite_score=best.get("composite_score", 0),
+                schema_id=schema_id,
+                surrogate_predictions=best.get("surrogate_predictions"),
+                acquisition_score=best.get("acquisition_score", 0),
             )
             return exp_id
         except Exception as e:
